@@ -57,6 +57,7 @@
 
 #include <windows.h>
 #include "MinHook.h"
+#include "pvp_glue.h"
 
 #include <cstdio>
 #include <cstring>
@@ -527,7 +528,11 @@ void __fastcall h_LevelUpdate(void* self) {
 // --- peer cursors ----------------------------------------------------------
 
 void __fastcall h_StatusMenu(void* self) {
+    // The PvP arena shows team 2's cats as allies in the portrait panel for the
+    // duration of the update (src/pvp).
+    pvp_status_menu_begin(self);
     o_StatusMenu(self);
+    pvp_status_menu_end();
 
     // After the original, for two reasons that happen to point the same way.
     // The hovered tile at StatusMenu+124 is written BY this function, so before
@@ -582,6 +587,9 @@ void __fastcall h_ButtonUpdate(void* self) {
     // INTO the host's run, Quit To Menu in the pause sidebar gets it back
     // OUT when the host has left. Same slot, same trampoline reasoning.
     leave_on_button_update(self);
+
+    // The PvP arena's pause-menu buttons (РЕВАНШ / ДОМОЙ tint and wiring).
+    pvp_button_update(self);
 }
 
 // The aim preview turns the acting cat while a decision is held, writing the

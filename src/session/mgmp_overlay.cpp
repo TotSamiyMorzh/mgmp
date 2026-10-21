@@ -13,6 +13,7 @@
 #include "mgmp_net.h"
 #include "mgmp_proto.h"
 #include "mgmp_ui.h"
+#include "pvp_glue.h"
 
 #include <windows.h>
 
@@ -977,6 +978,8 @@ void draw_cursor(uint8_t mode, float nx, float ny, const float rgb[3], float alp
 // been presented and reused, so there is no "after" to draw in.
 int __cdecl overlay_swap_detour(void* window) {
     overlay_on_swap(window);
+    // The PvP arena's per-frame work and its lobby window, under the debug panel.
+    pvp_frame();
     // The debug panel draws after the peer pointers and so sits on top of them,
     // which is the right way round: the panel is for the person at this
     // keyboard and must never be occluded by somebody else's arrow. It is

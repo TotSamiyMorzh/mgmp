@@ -185,7 +185,9 @@ void hook_defaults() {
     // game, and a single-player run has nothing for it to decide. It is turned
     // on below by net.role, next to the rest of the co-op surface.
     g_cfg.hook[T_CombatMenuUpdate] = false;
-    g_cfg.hook[T_ButtonUpdate]     = false;
+    // ON even solo: the PvP arena (src/pvp) hangs its pause-menu buttons off
+    // h_ButtonUpdate. Every other consumer of that detour is scope-gated.
+    g_cfg.hook[T_ButtonUpdate]     = true;
 
     // The aim-preview facing freeze. Also off without a session, and here the
     // reason is that the preview is real feedback: a solo player watching their

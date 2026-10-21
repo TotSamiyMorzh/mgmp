@@ -3,6 +3,7 @@
 // Phase 1 scope (see CLAUDE.md): get code running inside the process at fixed
 // RVAs and trace the turn/command boundaries. No networking, no determinism
 // work, no state changes.
+#include "pvp_glue.h"
 #include "mgmp_addresses.h"
 #include "mgmp_crash.h"
 #include "mgmp_config.h"
@@ -22,6 +23,7 @@
 namespace {
 
 wchar_t g_dll_dir[MAX_PATH] = {};
+HMODULE g_self_module = nullptr;
 
 // Raw-Win32 breadcrumb, independent of the CRT and of the trace log itself.
 // When injection goes wrong the interesting failures happen before the logger
@@ -186,6 +188,10 @@ DWORD WINAPI init_thread(LPVOID) {
     }
     log_raw("=== %d hooks live ===", n);
 
+    // The PvP arena (src/pvp): its own hooks, after MinHook is up and before the
+    // loader unparks the game, so none of them can miss the first frame.
+    pvp_init(g_self_module);
+
     // Tell the loader it can unpark the game. Without this the loader restores
     // the two bytes it patched into FrameBegin while MinHook may be writing its
     // own jump over the same bytes -- and FrameBegin is itself a hook target.
@@ -205,6 +211,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
     case DLL_PROCESS_ATTACH:
         DisableThreadLibraryCalls(module);
         compute_dll_dir(module);
+        g_self_module = module;
         breadcrumb("DllMain: PROCESS_ATTACH");
         // Do the real work off the loader lock. When injected into a suspended
         // process this still runs before the game's entry point gets going.

@@ -84,7 +84,21 @@ add_library(mgmp SHARED
     third_party/imgui/imgui_widgets.cpp
     third_party/imgui/backends/imgui_impl_win32.cpp
     third_party/imgui/backends/imgui_impl_opengl3.cpp
+    # PvP arena (ported from pvp/probe, the hotseat Mewjector mod): house-battle
+    # arena, referee, lobby, portraits. See src/pvp/pvp_glue.h for the seams.
+    src/pvp/pvp_glue.cpp
+    src/pvp/pvp_clone.cpp
+    src/pvp/pvp_arena.c
+    src/pvp/lobby.cpp
+    src/pvp/portraits.cpp
+    src/pvp/portrait/swf.cpp
+    src/pvp/portrait/gpak.cpp
+    src/pvp/portrait/catportrait.cpp
 )
+# The arena sources carry Russian UI text as UTF-8 literals.
+set_source_files_properties(
+    src/pvp/pvp_arena.c src/pvp/lobby.cpp src/pvp/portraits.cpp src/pvp/pvp_glue.cpp
+    PROPERTIES COMPILE_OPTIONS "/utf-8")
 set_target_properties(mgmp PROPERTIES OUTPUT_NAME "mgmp" PREFIX "")
 target_compile_definitions(mgmp PRIVATE
     WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS NOMINMAX
@@ -93,7 +107,8 @@ target_compile_options(mgmp PRIVATE /W3)
 # Flat quoted includes (#include "mgmp_hooks.h") resolve across folders via
 # these four dirs, so moving a file between layers never touches an #include.
 target_include_directories(mgmp PRIVATE
-    src/core src/determinism src/net src/session src/ui
+    src/core src/determinism src/net src/session src/ui src/pvp
+    third_party/minhook/include
     # stb_image.h, header-only; the implementation is compiled into
     # mgmp_overlay.cpp, which is the only translation unit that decodes a PNG.
     third_party
@@ -101,7 +116,7 @@ target_include_directories(mgmp PRIVATE
     # their directory prefix so this one entry covers both.
     third_party/imgui
 )
-target_link_libraries(mgmp PRIVATE minhook kernel32 user32 shell32)
+target_link_libraries(mgmp PRIVATE minhook kernel32 user32 shell32 opengl32)
 
 add_executable(mgmp_loader loader/mgmp_loader.cpp res/mgmp_loader.rc)
 target_compile_definitions(mgmp_loader PRIVATE _CRT_SECURE_NO_WARNINGS)

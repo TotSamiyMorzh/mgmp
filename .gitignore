@@ -65,3 +65,7 @@ desktop.ini
 .DS_Store
 
 !third_party/**
+
+# PvP arena: tables generated from the player's own resources.gpak (game text and
+# data) -- local only, never committed. Regenerate with pvp/tools/make_item_*.py.
+/src/pvp/*_gen.h
