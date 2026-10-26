@@ -90,6 +90,8 @@ uint64_t lockstep_battle_id();
 // identity without any negotiation -- both peers pass the same seed because
 // they entered the same node.
 void lockstep_enter_battle(uint64_t seed0);
+// PvP arena: decide each human cat's owning peer position (-1 = default split).
+void lockstep_set_split_owner(int (*fn)(const void* character));
 
 // A peer joined or reconnected: replay this battle's decisions to it so it can
 // fast-forward into a fight already under way. To that peer only.
@@ -118,6 +120,18 @@ bool lockstep_local_actor();
 // that is not in the roster (a summon), or an AI cat. The caller is cosmetic,
 // and a menu greyed out when it should not be reads as a bug in the game.
 bool lockstep_peer_owns_character(const void* character);
+
+// Is this brain a human-driven cat of the snapshot (either peer's)? The
+// GetChoice hook fences the simulation stream around the original for these:
+// a cat under a mind-control status (charm, madness) gets an AI decision
+// derived INSIDE its PlayerBrain's GetChoice, and that derivation draws. The
+// peer that does not own the cat polls it every frame until the owner's
+// decision arrives, so it re-derived -- and drew -- once per frame: 235 extra
+// steps in one measured PvP turn. With the fence neither peer's stream moves,
+// however many times either one asks.
+bool lockstep_human_brain(const void* brain);
+// ...and one THIS peer controls.
+bool lockstep_local_human_brain(const void* brain);
 
 // --- diagnostics ------------------------------------------------------------
 
@@ -176,7 +190,8 @@ uint32_t lockstep_preview_facing_count();
 // Cheap enough for a per-frame caller: one pass over the roster, no allocation,
 // and it returns immediately when lockstep is not in a battle.
 void     lockstep_state_fence_begin();
-uint32_t lockstep_state_fence_end(const char* what);
+// restore_vitals: also put HP, shield and max HP back (not for a cat that died).
+uint32_t lockstep_state_fence_end(const char* what, bool restore_vitals = false);
 uint32_t lockstep_state_fence_hits();
 
 } // namespace mgmp

@@ -549,6 +549,7 @@ bool savefile_adventure_is_loaded() { return adventure_is_loaded_impl(); }
 
 
 void savefile_init() {
+    if (config().net_pvp) return;   // PvP mode: no co-op meta layer
     ensure_state();
     if (g.announced) return;            // the host may have picked before this
     g.announced = true;
@@ -662,6 +663,7 @@ void savefile_catchup(uint8_t peer) {
 }
 
 void savefile_pump() {
+    if (config().net_pvp) return;   // PvP mode: no co-op meta layer
     ensure_state();
 
     // COUNTED HERE, ABOVE THE HOST-ONLY RETURN, because it is a FRAME counter
@@ -788,6 +790,7 @@ bool savefile_on_slot_click(void* ss, int slot) {
 }
 
 void savefile_on_message(const SaveFileMsg& m) {
+    if (config().net_pvp) return;   // PvP mode: no co-op meta layer
     ensure_state();
     if (!g.on) return;
     if (!g.is_client) {
@@ -990,6 +993,7 @@ const void* savefile_redirect_load() {
 }
 
 void savefile_on_button_update(void* button) {
+    if (config().net_pvp) return;   // PvP mode: no co-op meta layer
     // THE CHEAP TESTS FIRST, AND THE ORDER IS THE POINT. This runs for every
     // button in the game on every frame, so everything above the name read is
     // a load and a branch, and g.pending is false for all of a normal session.

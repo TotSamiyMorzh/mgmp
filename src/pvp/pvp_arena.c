@@ -29,7 +29,28 @@
 #include "pvp_mj_shim.h"
 #include "pvp_glue.h"
 #include "pvp_clone.h"
-#include "items_gen.h"
+
+#include "lobby.h"
+// Online (see the end of the file). Declared up here for the hotseat code that
+// hands over to it.
+static uint64_t fnv64(const void* p, uint32_t n, uint64_t h);
+static void auto_tick(void);
+static void auto_init(HMODULE self);
+static void auto_button(unsigned char* btn);
+static void auto_hooks(void);
+static void intro_hooks(HMODULE self);
+static void face_hooks(void);
+static void roll_x_hooks(void);
+static int  net_open_lobby(const lobby_cat* cats, int n, const lobby_settings* s);
+static int  net_lobby_tick(void);
+static int  net_route_action(long a);
+static int  net_end_choice(int rematch);
+static unsigned int rnd_fight(unsigned int n);
+static char          g_level_fixed[16];     // "pvp/g.lvl" while an online START fixed the level
+static unsigned char g_online_seed[32];     // the START's sim-stream seed
+static int           g_online_seed_set;
+static int           g_arena_online;        // the current arena came from an online START
+#include "gamedata.h"
 #include "lobby.h"
 
 // The game's operator new (used wherever the game will free what we hand it).
@@ -40,6 +61,7 @@ typedef void* (__fastcall *fn_game_new)(size_t);
 #define RVA_BATTLE_SETUP    0x1057D0
 #define OFF_BRAIN           0x68
 #define OFF_CATDATA         0x88
+#define OFF_CHAR_FACING        0x388
 #define OFF_FACTION_BASE    0x350
 #define OFF_FACTION_354     0x354
 #define OFF_FACTION_358     0x358
@@ -143,6 +165,8 @@ static int g_in_level_init;
 #define MAX_BIRDS 32
 static void* g_birds[MAX_BIRDS];
 static int g_round;
+static void* g_upkept[128];   // characters RoundUpkeep reached this round (online)
+static int   g_upkept_n;
 static unsigned long long g_last_upkeep_ms;
 static volatile LONG g_wave_pending;
 // Run 40: the level's monsters are created after Level::init returns, still inside
@@ -451,6 +475,13 @@ static int bird_kind_pick(void) {   // 0 small, 1 medium, 2 large, among the ena
     return n ? k[rnd(n)] : 0;
 }
 
+static unsigned int rnd_fight(unsigned int n);
+static int bird_kind_pick_fight(void) {   // online: from the fight's seeded generator
+    int k[3], n = 0;
+    for (int i = 0; i < 3; i++) if (g_bird_mask & (1 << i)) k[n++] = i;
+    return n ? k[rnd_fight(n)] : 0;
+}
+
 static unsigned int bird_pick(void) {
     return 9101 + bird_kind_pick();
 }
@@ -463,6 +494,7 @@ static unsigned int loot_pick(void) {
 
 // Returns the level path for this fight: "pvp/g.lvl" with cover / loot, else the plain arena.
 static const char* arena_level_for_fight(void) {
+    if (g_level_fixed[0]) return g_level_fixed;   // online: the host's level, already written
     static unsigned char buf[65536], out[65536 + 8 * 128];
     if ((g_cover_count <= 0 && g_mob_count <= 0 && g_bird_count <= 0 && (g_loot_count <= 0 || !g_loot_mask)) ||
         !g_modpath[0]) return kArenaLevel;
@@ -501,9 +533,10 @@ static const char* arena_level_for_fight(void) {
         spawn_tile[*(unsigned short*)(buf + rec + 8 * r + 2) * w + *(unsigned short*)(buf + rec + 8 * r)] = 1;
     int want = (g_cover_count + 1) / 2, placed = 0;
     if (want > 24) want = 24;
-    int mob_want = (g_mob_count + 1) / 2, mob_placed = 0;
+    int mob_want = g_mob_count / 2, mob_placed = 0;
     if (mob_want > 8) mob_want = 8;
-    int bird_want = g_bird_count, bird_placed = 0;
+    int mob_odd = g_mob_count & 1;   // owner, run 51: an odd monster, placed alone
+    int bird_want = g_bird_count, bird_placed = 0, mob_placed_single = 0;
     if (bird_want > 8) bird_want = 8;
     int loot_want = g_loot_mask ? g_loot_count : 0, loot_placed = 0;
     if (loot_want > 32) loot_want = 32;
@@ -511,28 +544,30 @@ static const char* arena_level_for_fight(void) {
     int q = rec + 8 * n;
     unsigned char used[64 * 64];      // anything placed here, cover or loot
     memset(used, 0, sizeof used);
-    for (int tries = 0; placed + mob_placed + bird_placed + loot_placed < want + mob_want + bird_want + loot_want &&
+    for (int tries = 0; placed + mob_placed + bird_placed + loot_placed < want + mob_want + bird_want + loot_want + mob_odd &&
                         tries < 2000; tries++) {
         int x = rnd(w), y = rnd(h), mx = w - 1 - x, my = h - 1 - y;
         // cover, then monsters (mirrored pairs), then birds, then loot (one by one)
         int mob = placed >= want && mob_placed < mob_want;
-        int bird = placed >= want && !mob && bird_placed < bird_want;
-        int loot = placed >= want && !mob && !bird;
-        int single = bird || loot;
+        int mob1 = placed >= want && !mob && mob_odd;
+        int bird = placed >= want && !mob && !mob1 && bird_placed < bird_want;
+        int loot = placed >= want && !mob && !mob1 && !bird;
+        int single = mob1 || bird || loot;
         if (!single && x == mx && y == my) continue;
         if (used[y * w + x] || (!single && used[my * w + mx])) continue;
         if (!single && (blocked[y * w + x] || blocked[my * w + mx])) continue;
-        if (bird && blocked[y * w + x]) continue;
+        if ((bird || mob1) && blocked[y * w + x]) continue;
         if (loot && (spawn_tile[y * w + x] ||
                      !(grid[y * w + x] == 0 || grid[y * w + x] == 2 || grid[y * w + x] == 3))) continue;
-        unsigned int id = loot ? loot_pick() : bird ? bird_pick() : mob ? mob_pick() : cover_pick();
+        unsigned int id = loot ? loot_pick() : bird ? bird_pick() : (mob || mob1) ? mob_pick() : cover_pick();
         if (single) {   // owner, run 35: loot anywhere, one by one, not mirrored
             *(unsigned short*)(out + q) = (unsigned short)x;
             *(unsigned short*)(out + q + 2) = (unsigned short)y;
             *(unsigned int*)(out + q + 4) = id;
             q += 8;
             used[y * w + x] = 1;
-            if (bird) { blocked[y * w + x] = 1; bird_placed++; } else loot_placed++;
+            if (mob1) { blocked[y * w + x] = 1; mob_odd = 0; mob_placed_single++; }
+            else if (bird) { blocked[y * w + x] = 1; bird_placed++; } else loot_placed++;
             continue;
         }
         int pts[2][2] = { { x, y }, { mx, my } };
@@ -548,7 +583,7 @@ static const char* arena_level_for_fight(void) {
     }
     memcpy(out + q, buf + len - 4, 4);
     q += 4;
-    *(int*)(out + 16) = n + 2 * placed + 2 * mob_placed + bird_placed + loot_placed;
+    *(int*)(out + 16) = n + 2 * placed + 2 * mob_placed + mob_placed_single + bird_placed + loot_placed;
     f = fopen(dst, "wb");
     if (!f) { plog("cover: cannot write %s", dst); return kArenaLevel; }
     fwrite(out, 1, q, f);
@@ -599,6 +634,7 @@ static void start_fight(unsigned char* closing, int from_house) {
     memset(g_birds, 0, sizeof g_birds);
     g_round = 0;
     g_last_upkeep_ms = 0;
+    g_upkept_n = 0;
     InterlockedExchange(&g_wave_pending, 0);
     g_spawning = 1;
     g_start_house_fight(g_fake_component, &level, &name);
@@ -951,6 +987,12 @@ static int g_money_on, g_money;
 
 static void __fastcall hook_level_init(void* level) {
     memset(g_side_used, 0, sizeof g_side_used);
+    if (g_arena_active && g_online_seed_set) {   // online: both machines from the same sim stream
+        __try {
+            unsigned char* r = sim_rng();
+            if (r) { memcpy(r, g_online_seed, 32); plog("net: sim stream set from the START seed"); }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
     g_in_level_init = 1;
     g_orig_level_init(level);
     g_in_level_init = 0;
@@ -1166,7 +1208,8 @@ static int collect_storage(lobby_item* out, int max) {
 static const char* pick_item(int slot) {
     if (g_item_preset == PRESET_HOUSE)
         return g_pool_count[slot] ? g_pool[slot][rnd(g_pool_count[slot])] : NULL;
-    return kItemCountBySlot[slot] ? kItemsBySlot[slot][rnd(kItemCountBySlot[slot])] : NULL;
+    int n = gd_slot_count(slot);
+    return n ? gd_slot_item(slot, (int)rnd(n)) : NULL;
 }
 
 static void restore_items(void);
@@ -1205,7 +1248,30 @@ static void apply_items(void) {
                 const char* name = g_pick_kit[i][sl];
                 if (!name[0]) continue;
                 unsigned char* e = g_cat_snaps[i].cat + OFF_CAT_SLOT0 + sl * EQUIP_SIZE;
-                if (build_item(name, e)) { built++; plog("items: cat %d slot %d <- %s (picked)", i, sl, name); }
+                // Run 57 (online): SmallMeteor rolls a random colorless ability into
+                // itself when constructed (str_aux_initialize), and each machine built
+                // its kits from its own house-time stream -- Roll on one, Donate on the
+                // other. Online, both TLS streams are seeded from the START seed and
+                // the slot for the constructor, then put back.
+                unsigned char saved[64], *tls = NULL;
+                if (g_arena_online && g_online_seed_set) {
+                    unsigned char** blocks = (unsigned char**)__readgsqword(0x58);
+                    tls = blocks ? blocks[0] : NULL;
+                    if (tls) {
+                        memcpy(saved, tls + 0x178, 64);   // sim 0x178 and presentation 0x198
+                        unsigned long long x = fnv64(g_online_seed, 32, 0xCBF29CE484222325ULL) ^
+                                               ((unsigned long long)(i * NUM_SLOTS + sl + 1) * 0x9E3779B97F4A7C15ULL);
+                        for (int w = 0; w < 8; w++) {     // splitmix64
+                            unsigned long long z = (x += 0x9E3779B97F4A7C15ULL);
+                            z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+                            z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+                            ((unsigned long long*)(tls + 0x178))[w] = z ^ (z >> 31);
+                        }
+                    }
+                }
+                int ok = build_item(name, e);
+                if (tls) memcpy(tls + 0x178, saved, 64);
+                if (ok) { built++; plog("items: cat %d slot %d <- %s (picked)", i, sl, name); }
                 else { plog("items: could not build %s", name); make_empty_equipment(e); }
             }
         plog("items: %d picked item(s) built", built);
@@ -1269,7 +1335,7 @@ static void restore_items(void) {
 // source, ?, GonObject* pool) would return at once in an arena (it bails when
 // MewDirector+0x70C is set, which the house-battle start sets) and would otherwise
 // put the item into the house inventory. So during an arena it is replaced: a
-// random regular item (items_gen.h) is built and equipped the way StealEquipment
+// random regular item (gamedata.cpp: the slot pool read from the player's game) is built and equipped the way StealEquipment
 // (FUN_14030A050) equips a stolen item -- FUN_1400CA2E0(CatData*, Equipment*, 4, 0)
 // then FUN_1400FE980(Character*) to rebuild the fighter. The target slot is emptied
 // first: FUN_1400CA2E0 sends the old item to the inventory (FUN_1402E13F0), and
@@ -1292,9 +1358,10 @@ static void __fastcall hook_find_item(void* a, void* recipient, void* src, void*
         unsigned char* cat = ch ? *(unsigned char**)(ch + OFF_CATDATA) : NULL;
         if (!cat || !team_of_cat(cat)) { plog("birds: reward for %p, not an arena cat -- dropped", recipient); return; }
         unsigned char* base = (unsigned char*)GetModuleHandleA(NULL);
-        int slot = rnd(NUM_SLOTS);
-        // Any regular item (items_gen.h), whatever the item preset.
-        const char* name = kItemCountBySlot[slot] ? kItemsBySlot[slot][rnd(kItemCountBySlot[slot])] : NULL;
+        int slot = rnd_fight(NUM_SLOTS);
+        // Any regular item (gamedata.cpp: the slot pool read from the player's game), whatever the item preset.
+        int pool = gd_slot_count(slot);
+        const char* name = pool ? gd_slot_item(slot, (int)rnd_fight(pool)) : NULL;
         unsigned char item[EQUIP_SIZE];
         if (!name || !build_item(name, item)) { plog("birds: could not build an item"); return; }
         int sl = ((fn_item_slot)(base + RVA_ITEM_SLOT))(item);
@@ -1349,10 +1416,30 @@ static int  g_bird_wave = 1;          // birds per wave
 static int  g_round;                  // rounds seen in this fight
 static unsigned long long g_last_upkeep_ms;
 static volatile LONG g_wave_pending;
+static void bird_wave_spawn(void);
 
 static void __fastcall hook_round_upkeep(void* ch) {
     g_orig_round_upkeep(ch);
     if (!g_arena_active) return;
+    if (g_arena_online) {
+        // Online the round and the wave must be the same instant of the simulation
+        // on both machines, so neither comes from the wall clock or a frame tick: a
+        // round starts when RoundUpkeep reaches a character it already reached this
+        // round (the game calls it per character, in the same order on both), and
+        // the wave spawns right here, inside the simulation step. The free tile comes
+        // from FUN_1408AC5B0, which draws on the sim stream, and the kind from the
+        // fight's seeded generator.
+        int seen = 0;
+        for (int i = 0; i < g_upkept_n; i++) if (g_upkept[i] == ch) { seen = 1; break; }
+        if (seen) g_upkept_n = 0;
+        if (g_upkept_n == 0) {
+            g_round++;
+            plog("round: %d (online)", g_round);
+            if (g_bird_every > 0 && g_round > 1 && (g_round - 1) % g_bird_every == 0) bird_wave_spawn();
+        }
+        if (g_upkept_n < (int)(sizeof g_upkept / sizeof g_upkept[0])) g_upkept[g_upkept_n++] = ch;
+        return;
+    }
     unsigned long long now = GetTickCount64();
     if (now - g_last_upkeep_ms > 1000) {
         g_round++;
@@ -1364,6 +1451,10 @@ static void __fastcall hook_round_upkeep(void* ch) {
 
 static void bird_wave_tick(void) {
     if (!InterlockedExchange(&g_wave_pending, 0) || !g_arena_active) return;
+    bird_wave_spawn();
+}
+
+static void bird_wave_spawn(void) {
     unsigned char* base = (unsigned char*)GetModuleHandleA(NULL);
     void** cur_scene = (void**)(base + RVA_CURRENT_SCENE);
     void* saved_scene = *cur_scene;
@@ -1398,7 +1489,7 @@ static void bird_wave_tick(void) {
             }
             static const char* kNames[3] = { "PvpBirdSmall", "PvpBirdMed", "PvpBirdLarge" };
             msvc_string name;
-            make_sso(&name, kNames[bird_kind_pick()]);   // the callee destroys it
+            make_sso(&name, kNames[g_arena_online ? bird_kind_pick_fight() : bird_kind_pick()]);   // the callee destroys it
             double pos[3] = { x + 0.5, 0.0, y + 0.5 };
             void* ent = ((fn_spawn_unit)(base + RVA_SPAWN_UNIT))(NULL, NULL, &name, tile, pos, 3);
             plog("birds: wave bird at (%d,%d) -> %p", x, y, ent);
@@ -1449,6 +1540,7 @@ static void start_arena(void) {
     unsigned char* md = *(unsigned char**)((unsigned char*)GetModuleHandleA(NULL) + RVA_MEWDIRECTOR_PTR);
     if (!md || !pick_teams(house)) return;
     g_house_picked = 0;
+    g_level_fixed[0] = 0; g_online_seed_set = 0; g_arena_online = 0;   // hotseat
     start_arena_with_teams(house, md);
 }
 
@@ -1467,6 +1559,48 @@ static int read_std_wstring_utf8(const unsigned char* p, char* out, int outsz) {
 }
 
 static char g_player_name[2][32] = { "Игрок 1", "Игрок 2" };
+
+// The arena's language follows the game's (settings.txt "current_language", the
+// newest one under %APPDATA%\Glaiel Games\Mewgenics): Russian when the game is in
+// Russian, English otherwise. pvp.ini [probe] Language=ru|en overrides it.
+static int g_en;
+#define TRW(ru, en) (g_en ? (en) : (ru))
+
+static void detect_language(HMODULE self) {
+    char ini[MAX_PATH], forced[8] = "";
+    pvp_ini_path(self, ini);
+    GetPrivateProfileStringA("probe", "Language", "", forced, sizeof forced, ini);
+    if (forced[0]) { g_en = _stricmp(forced, "ru") != 0; return; }
+    char base[MAX_PATH], pat[MAX_PATH], best[MAX_PATH] = "";
+    FILETIME best_t = { 0, 0 };
+    if (!GetEnvironmentVariableA("APPDATA", base, MAX_PATH)) { g_en = 1; return; }
+    _snprintf(pat, MAX_PATH, "%s\\Glaiel Games\\Mewgenics\\*", base);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pat, &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || fd.cFileName[0] == '.') continue;
+            char f[MAX_PATH];
+            WIN32_FILE_ATTRIBUTE_DATA a;
+            _snprintf(f, MAX_PATH, "%s\\Glaiel Games\\Mewgenics\\%s\\settings.txt", base, fd.cFileName);
+            if (GetFileAttributesExA(f, GetFileExInfoStandard, &a) && CompareFileTime(&a.ftLastWriteTime, &best_t) > 0) {
+                best_t = a.ftLastWriteTime;
+                strcpy(best, f);
+            }
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+    }
+    g_en = 1;
+    FILE* f = best[0] ? fopen(best, "rb") : NULL;
+    if (f) {
+        char line[256];
+        while (fgets(line, sizeof line, f))
+            if (!strncmp(line, "current_language ", 17)) { g_en = strncmp(line + 17, "ru", 2) != 0; break; }
+        fclose(f);
+    }
+    if (g_en) { strcpy(g_player_name[0], "Player 1"); strcpy(g_player_name[1], "Player 2"); }
+    plog("language: %s (from %s)", g_en ? "English" : "Russian", best[0] ? best : "default");
+}
 
 static void open_lobby(void) {
     unsigned char* house = find_house_scene();
@@ -1492,7 +1626,7 @@ static void open_lobby(void) {
                 c->cat = rooms[r].cats[i];
                 c->key = *(long long*)(rooms[r].cats[i] + OFF_CAT_SQL_KEY);
                 if (!read_std_wstring_utf8(rooms[r].cats[i] + 0x18, c->name, sizeof c->name))
-                    sprintf(c->name, "кот %lld", c->key);
+                    sprintf(c->name, g_en ? "cat %lld" : "кот %lld", c->key);
                 strncpy(c->room, rooms[r].name, sizeof c->room - 1);
                 // v20: face parts (combat_roster's offsets: BodyParts @+0x60, texture +0x18,
                 // palette +0x1C, part descriptors @+0x2C stride 0x54, index +4).
@@ -1550,11 +1684,13 @@ static void open_lobby(void) {
     int nstore = collect_storage(store, LOBBY_MAX_ITEMS);
     plog("lobby: %d item(s) in the storage", nstore);
     lobby_set_storage(store, nstore);
+    if (net_open_lobby(cats, n, &s)) return;
     lobby_open(cats, n, &s);
 }
 
 static void lobby_tick(void) {
     lobby_on_swap();
+    if (net_lobby_tick()) return;
     static lobby_cat chosen[LOBBY_MAX_CATS];
     int n = 0;
     lobby_settings s;
@@ -1581,6 +1717,7 @@ static void lobby_tick(void) {
     g_bird_every = s.bird_every;
     g_bird_wave = s.bird_wave;
     g_house_picked = s.item_preset == PRESET_HOUSE;
+    g_level_fixed[0] = 0; g_online_seed_set = 0; g_arena_online = 0;   // hotseat
     g_cat_snap_count = 0;
     g_team_size[0] = g_team_size[1] = 0;
     // mgmp build: the fight uses CLONES of the chosen cats (pvp_clone.h) -- built
@@ -1769,6 +1906,7 @@ static void end_choice_tick(void) {
     int enter = key_pressed(VK_RETURN, &g_key_enter_down);
     int rematch = key_pressed('R', &g_key_r_down);
     if (!enter && !rematch) return;
+    if (net_end_choice(rematch)) return;   // online: both machines go together
     g_end_at = 0;
     g_banner_ent = NULL;
     g_freeze_at = 0;
@@ -1865,8 +2003,8 @@ static void referee_tick(void) {
     plog("referee: side %d wins (alive %d vs %d of %d vs %d), waiting for Enter / R",
          winner, alive[1], alive[2], total[1], total[2]);
     g_banner_ent = show_banner(winner == 1
-        ? L"ИГРОК 1 ПОБЕДИЛ!\nESC — МЕНЮ: РЕВАНШ / ДОМОЙ"
-        : L"ИГРОК 2 ПОБЕДИЛ!\nESC — МЕНЮ: РЕВАНШ / ДОМОЙ");
+        ? TRW(L"ИГРОК 1 ПОБЕДИЛ!\nESC — МЕНЮ: РЕВАНШ / ДОМОЙ", L"PLAYER 1 WINS!\nESC — MENU: REMATCH / HOME")
+        : TRW(L"ИГРОК 2 ПОБЕДИЛ!\nESC — МЕНЮ: РЕВАНШ / ДОМОЙ", L"PLAYER 2 WINS!\nESC — MENU: REMATCH / HOME"));
     g_freeze_at = g_banner_ent ? GetTickCount64() + g_freeze_ms : 0;
     // Swallow a key already held at this moment (an Enter that ended the turn).
     g_key_enter_down = (GetAsyncKeyState(VK_RETURN) & 0x8000) != 0;
@@ -1891,19 +2029,46 @@ static fn_portrait_update g_orig_portrait;
 // mgmp build: StatusMenu::update is mgmp's detour (h_StatusMenu), which calls
 // these two around the original instead of a second hook on the same function.
 static void* g_lifted[MAX_ARENA_CATS];
+static int   g_lifted_was[MAX_ARENA_CATS];   // the faction to put back
 static int   g_lifted_n;
+// Run 52 (online): StatusMenu::update is presentation, but a turn whose only
+// difference between the peers was the number of frames drew different numbers of
+// sim-stream values once a cat had been charmed (rng diverged, every cat row equal).
+// During an arena the sim stream is put back after the panel's update, so the HUD
+// can never move the simulation, however many frames each machine draws.
+static unsigned char g_hud_rng[32];
+static int           g_hud_rng_saved;
 
 void pvp_status_menu_begin(void* panel) {
     void** lifted = g_lifted;
     int n = 0;
     (void)panel;
     g_lifted_n = 0;
+    g_hud_rng_saved = 0;
     if (g_arena_active) {
+        __try {
+            unsigned char* r = sim_rng();
+            if (r) { memcpy(g_hud_rng, r, 32); g_hud_rng_saved = 1; }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+    if (g_arena_active) {
+        // Online (owner): this player's own cats get the player panel with mana,
+        // the opponent's cats the enemy panel without it -- on both machines,
+        // whichever team each one is.
+        int mine = g_arena_online ? (pvp_net_mode() == 1 ? 1 : pvp_net_mode() == 2 ? 2 : 0) : 0;
         __try {
             for (int i = 0; i < g_arena_count; i++) {
                 unsigned char* c = (unsigned char*)g_arena_cats[i];
-                if (F(c, OFF_FACTION_BASE) == FACTION_ENEMIES && flipped_has(c)) {
-                    F(c, OFF_FACTION_BASE) = FACTION_ALLIES;
+                int was = F(c, OFF_FACTION_BASE), want = was;
+                if (mine) {
+                    int t = team_of_cat(*(void**)(c + OFF_CATDATA));
+                    if (t) want = t == mine ? FACTION_ALLIES : FACTION_ENEMIES;
+                } else if (was == FACTION_ENEMIES && flipped_has(c)) {
+                    want = FACTION_ALLIES;
+                }
+                if (want != was) {
+                    F(c, OFF_FACTION_BASE) = want;
+                    g_lifted_was[n] = was;
                     lifted[n++] = c;
                 }
             }
@@ -1913,7 +2078,18 @@ void pvp_status_menu_begin(void* panel) {
 }
 
 void pvp_status_menu_end(void) {
-    for (int i = 0; i < g_lifted_n; i++) F(g_lifted[i], OFF_FACTION_BASE) = FACTION_ENEMIES;
+    if (g_hud_rng_saved) {
+        __try {
+            unsigned char* r = sim_rng();
+            if (r && memcmp(r, g_hud_rng, 32) != 0) {
+                static int said;
+                if (said++ < 5) plog("hud: StatusMenu::update moved the sim stream -- put back");
+                memcpy(r, g_hud_rng, 32);
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        g_hud_rng_saved = 0;
+    }
+    for (int i = 0; i < g_lifted_n; i++) F(g_lifted[i], OFF_FACTION_BASE) = g_lifted_was[i];
     g_lifted_n = 0;
 }
 
@@ -2057,6 +2233,7 @@ static fn_button_update g_orig_button_update;
 
 void pvp_button_update(void* self) {
     unsigned char* btn = (unsigned char*)self;
+    auto_button(btn);
     if (!g_arena_active || !btn || (btn != g_btn_menu && btn != g_btn_quit)) return;
     // Run 35: passive cards turned red. Once the pause menu closes, our buttons are
     // freed and the game puts other Buttons (passive cards) at the same address, so
@@ -2120,15 +2297,15 @@ static void __fastcall hook_setup_sidebar(void* pause, char arg) {
         // and 4 (QuitToMenu, Save & Quit) become РЕВАНШ and ДОМОЙ, slot 5 (GiveUp)
         // is hidden. This also takes away the two exits that would leave an arena
         // without restoring anything (and let the exit-time save write it).
-        set_button(g_btn_menu, L"РЕВАНШ", ACT_REMATCH);
-        set_button(g_btn_quit, L"ДОМОЙ", ACT_HOME);
+        set_button(g_btn_menu, TRW(L"РЕВАНШ", L"REMATCH"), ACT_REMATCH);
+        set_button(g_btn_quit, TRW(L"ДОМОЙ", L"HOME"), ACT_HOME);
         // Owner, run 19: both red -- applied by hook_button_update, not here.
         if (g_btn_giveup) hide_button(g_btn_giveup);
     } else if (g_arena_active) {
-        if (g_btn_giveup) set_button(g_btn_giveup, L"ДОМОЙ", ACT_NONE);
-        if (g_btn_menu) set_button(g_btn_menu, L"РЕВАНШ", ACT_REMATCH);
+        if (g_btn_giveup) set_button(g_btn_giveup, TRW(L"ДОМОЙ", L"HOME"), ACT_NONE);
+        if (g_btn_menu) set_button(g_btn_menu, TRW(L"РЕВАНШ", L"REMATCH"), ACT_REMATCH);
     } else if (find_house_scene() && g_btn_giveup) {
-        set_button(g_btn_giveup, L"АРЕНА", ACT_START_ARENA);
+        set_button(g_btn_giveup, TRW(L"АРЕНА", L"ARENA"), ACT_START_ARENA);
     }
 }
 
@@ -2136,15 +2313,216 @@ static void do_rematch(void);
 
 static void pending_action_tick(void) {
     LONG a = InterlockedExchange(&g_pending_action, ACT_NONE);
+    if (net_route_action(a)) return;
     if (a == ACT_START_ARENA && !g_arena_active) open_lobby();
     else if (a == ACT_REMATCH && g_arena_active) do_rematch();
     else if (a == ACT_HOME && g_arena_active) InterlockedExchange(&g_pending_exit, 1);
 }
 
+// Run 55 (online, diagnostic): the turn-15 hash differed on rng alone while every
+// RECORDED draw of that turn matched -- from one shared state the host stepped the
+// sim stream 6 times before the hash and the client 43, all through code the
+// recorder cannot see (an inlined xoshiro step; ~100 functions have one). So during
+// an online fight a hardware data breakpoint watches the first word of the sim
+// stream: every step writes it, and each writer's address goes to pvp_rngwatch.log.
+// The two peers' logs agree line for line until the culprit's first extra step.
+#define RW_RING 16384
+static unsigned long long g_rw_rip[RW_RING], g_rw_ret[RW_RING], g_rw_val[RW_RING];
+#define RW_DEPTH 8
+static unsigned long long g_rw_stk[RW_RING][RW_DEPTH];   // return addresses into the exe, nearest first
+static volatile LONG g_rw_head, g_rw_tail;
+static void*          g_rw_veh;
+// Run 58: the RNG agrees now; the watch moved to the FACING of team 2's cats
+// (Character+0x388, slots 0..3) -- a cat's facing changed on its owner only and
+// a backstab differed 14 turns later. Log: pvp_facewatch.log.
+static unsigned char* g_rw_addrs[4];
+static int            g_rw_nslots;
+static unsigned char  g_rw_slot[RW_RING];
+static DWORD          g_rw_tid;
+static int            g_rw_armed, g_rw_tried;
+static FILE*          g_rw_log;
+static HMODULE        g_rw_self;
+static LONG           g_rw_lost;
+
+static LONG CALLBACK rw_veh(EXCEPTION_POINTERS* e) {
+    if (e->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP) return EXCEPTION_CONTINUE_SEARCH;
+    CONTEXT* c = e->ContextRecord;
+    if (!(c->Dr6 & 0xF) || GetCurrentThreadId() != g_rw_tid) return EXCEPTION_CONTINUE_SEARCH;
+    int slot = (c->Dr6 & 1) ? 0 : (c->Dr6 & 2) ? 1 : (c->Dr6 & 4) ? 2 : 3;
+    LONG h = g_rw_head;
+    if (h - g_rw_tail < RW_RING) {
+        g_rw_rip[h % RW_RING] = c->Rip;
+        g_rw_ret[h % RW_RING] = *(unsigned long long*)c->Rsp;
+        g_rw_val[h % RW_RING] = *(unsigned long long*)g_rw_addrs[slot];
+        g_rw_slot[h % RW_RING] = (unsigned char)slot;
+        // Who asked, heuristically: stack words pointing just past a call in the
+        // exe's code. Frames without one are skipped; enough to name the caller.
+        unsigned long long exe = (unsigned long long)GetModuleHandleA(NULL);
+        unsigned long long* sp = (unsigned long long*)c->Rsp;
+        int k = 0;
+        for (int w = 0; w < 400 && k < RW_DEPTH; w++) {
+            unsigned long long v = sp[w];
+            if (v < exe + 0x1000 || v >= exe + 0xD3E000) continue;
+            const unsigned char* q = (const unsigned char*)v;
+            if (q[-5] == 0xE8 || (q[-6] == 0xFF && q[-5] == 0x15) ||
+                (q[-2] == 0xFF && (q[-1] & 0xF8) == 0xD0) ||
+                (q[-3] == 0xFF && (q[-2] & 0x38) == 0x10 && (q[-2] & 0xC0) == 0x40) ||
+                (q[-6] == 0xFF && (q[-5] & 0x38) == 0x10 && (q[-5] & 0xC0) == 0x80))
+                g_rw_stk[h % RW_RING][k++] = v;
+        }
+        for (; k < RW_DEPTH; k++) g_rw_stk[h % RW_RING][k] = 0;
+        g_rw_head = h + 1;
+    } else {
+        g_rw_lost++;
+    }
+    c->Dr6 = 0;
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+// A thread cannot reliably set its own debug registers, so a helper suspends the
+// game thread, writes slot 0 and resumes it.
+static DWORD WINAPI rw_set_thread(LPVOID on) {
+    HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME, FALSE, g_rw_tid);
+    if (!t) return 1;
+    DWORD ok = 0;
+    if (SuspendThread(t) != (DWORD)-1) {
+        CONTEXT c;
+        memset(&c, 0, sizeof c);
+        c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+        if (GetThreadContext(t, &c)) {
+            c.Dr7 &= ~0xFFFF00FFull;                                  // slots 0..3: L/G, RW, LEN
+            DWORD64* dr[4] = { &c.Dr0, &c.Dr1, &c.Dr2, &c.Dr3 };
+            for (int i = 0; i < 4; i++) {
+                *dr[i] = 0;
+                if (on && i < g_rw_nslots && g_rw_addrs[i]) {
+                    *dr[i] = (DWORD64)g_rw_addrs[i];
+                    c.Dr7 |= (1ull << (2 * i)) | (1ull << (16 + 4 * i)) | (3ull << (18 + 4 * i));   // write, 8 bytes
+                }
+            }
+            ok = SetThreadContext(t, &c) ? 1 : 0;
+        }
+        ResumeThread(t);
+    }
+    CloseHandle(t);
+    return ok ? 0 : 2;
+}
+
+static int rw_set(int on) {
+    HANDLE th = CreateThread(NULL, 0, rw_set_thread, (LPVOID)(INT_PTR)on, 0, NULL);
+    if (!th) return 0;
+    WaitForSingleObject(th, 5000);
+    DWORD code = 1;
+    GetExitCodeThread(th, &code);
+    CloseHandle(th);
+    return code == 0;
+}
+
+static void rw_addr_str(unsigned long long a, char* out, size_t n) {
+    unsigned long long exe = (unsigned long long)GetModuleHandleA(NULL);
+    unsigned long long me = (unsigned long long)g_rw_self;
+    if (a >= exe && a < exe + 0x1574000) snprintf(out, n, "e+%07llX", a - exe);
+    else if (me && a >= me && a < me + 0x1000000) snprintf(out, n, "m+%06llX", a - me);
+    else snprintf(out, n, "%llX", a);
+}
+
+static void rw_flush(void) {
+    if (!g_rw_log) return;
+    while (g_rw_tail != g_rw_head) {
+        LONG i = g_rw_tail % RW_RING;
+        char a[32], b[32];
+        rw_addr_str(g_rw_rip[i], a, sizeof a);
+        rw_addr_str(g_rw_ret[i], b, sizeof b);
+        if (g_rw_slot[i] == 0)
+            fprintf(g_rw_log, "%ld rng %s %s %016llx", g_rw_tail, a, b, g_rw_val[i]);
+        else
+            fprintf(g_rw_log, "%ld cat%d %s %s face(%d,%d)", g_rw_tail, g_rw_slot[i] - 1, a, b,
+                    (int)(g_rw_val[i] & 0xFFFFFFFF), (int)(g_rw_val[i] >> 32));
+        for (int k = 0; k < RW_DEPTH && g_rw_stk[i][k]; k++) {
+            rw_addr_str(g_rw_stk[i][k], a, sizeof a);
+            fprintf(g_rw_log, " %s", a);
+        }
+        fputc('\n', g_rw_log);
+        g_rw_tail++;
+    }
+    if (g_rw_lost) { fprintf(g_rw_log, "!! %ld write(s) lost (ring full)\n", g_rw_lost); g_rw_lost = 0; }
+    fflush(g_rw_log);
+}
+
+// Armed from the START until the fight is over; once per online fight.
+// Off unless pvp.ini [debug] Watch=1: a release build sets no debug registers and
+// installs no exception handler of its own.
+static int g_rw_enabled;
+
+static void rw_tick(void) {
+    if (!g_rw_enabled) return;
+    int want = g_arena_online && g_arena_active;
+    int n2 = 0;
+    unsigned char* t2[4];
+    if (want && !g_rw_armed && !g_rw_tried) {
+        __try {
+            for (int i = 0; i < g_arena_count && n2 < 4; i++) {
+                unsigned char* ch = (unsigned char*)g_arena_cats[i];
+                if (team_of_cat(*(void**)(ch + OFF_CATDATA)) == 1) t2[n2++] = ch;   // run 59: the host's team diverged
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) { n2 = 0; }
+        if (n2 < g_team_size[0] || n2 == 0) want = 0;   // not all spawned yet
+        if (n2 > 3) n2 = 3;                              // slot 0 is the sim stream
+    }
+    if (want && !g_rw_armed && !g_rw_tried) {
+        g_rw_tried = 1;
+        g_rw_nslots = n2 + 1;
+        g_rw_addrs[0] = sim_rng();
+        for (int i = 0; i < n2; i++) g_rw_addrs[i + 1] = t2[i] + OFF_CHAR_FACING;
+        g_rw_tid = GetCurrentThreadId();
+        if (!g_rw_veh) g_rw_veh = AddVectoredExceptionHandler(1, rw_veh);
+        if (!g_rw_log) {
+            char path[MAX_PATH];
+            GetModuleFileNameA(g_rw_self, path, MAX_PATH);
+            char* slash = strrchr(path, '\\');
+            if (slash) strcpy(slash + 1, "pvp_facewatch.log");
+            g_rw_log = fopen(path, "w");
+        }
+        g_rw_head = g_rw_tail = 0;
+        g_rw_armed = rw_set(1);
+        plog("net: facing watch %s (%d team-2 cat(s), thread %lu)", g_rw_armed ? "ARMED" : "could not arm",
+             n2, g_rw_tid);
+        if (g_rw_log) {
+            fprintf(g_rw_log, "# fight start, armed=%d\n", g_rw_armed);
+            for (int i = 0; i < n2; i++) {
+                int x = 0, y = 0, tx = 0, ty = 0;
+                __try {
+                    x = *(int*)(t2[i] + OFF_CHAR_FACING); y = *(int*)(t2[i] + OFF_CHAR_FACING + 4);
+                    unsigned char* to = *(unsigned char**)(t2[i] + OFF_CHAR_TOBJ);
+                    tx = *(int*)(to + 0x48); ty = *(int*)(to + 0x4C);
+                } __except (EXCEPTION_EXECUTE_HANDLER) {}
+                fprintf(g_rw_log, "# cat%d at (%d,%d) facing (%d,%d)\n", i, tx, ty, x, y);
+            }
+            fflush(g_rw_log);
+        }
+    } else if (g_rw_armed && !(g_arena_online && g_arena_active)) {
+        static int grace;
+        if (g_arena_active || g_spawning) grace = 0;
+        else if (++grace > 600) {   // not active for ~10 s: the fight is over
+            rw_set(0);
+            g_rw_armed = 0;
+            rw_flush();
+            if (g_rw_log) { fprintf(g_rw_log, "# fight over\n"); fflush(g_rw_log); }
+            plog("net: facing watch off");
+        }
+    }
+    if (!g_arena_online) g_rw_tried = 0;
+    rw_flush();
+}
+
 void pvp_frame(void) {
+    rw_tick();
+    auto_tick();
     if (!find_house_scene() && !g_arena_active && !lobby_is_open()) return;   // nothing to do outside the house/arena
     int down = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
-    if (down && !g_f9_down && game_has_focus() && !g_arena_active && !lobby_is_open()) start_arena();
+    if (down && !g_f9_down && game_has_focus() && !g_arena_active && !lobby_is_open()) {
+        if (pvp_net_mode()) open_lobby();   // online: never a one-machine quick fight
+        else start_arena();
+    }
     g_f9_down = down;
     pending_exit_tick();
     pending_action_tick();
@@ -2158,7 +2536,69 @@ static void __fastcall hook_house_init(void* house) {
     plog("HousePlaceholder::init this=%p", house);
 }
 
+// Run 53 (online): a host cat moved, and on the HOST only it turned (0,-1) -> (1,0);
+// the client's copy kept its facing. The next hit on it was a backstab on one
+// machine and not on the other (27 vs 29 HP). The owner's PlayerBrain update
+// (vtable slot 10, FUN_140778DA0: 8 touches of Character+0x388, two TacticsObject
+// placements for the move/attack preview) turns the cat toward what the player is
+// aiming at -- presentation, on the owner's machine only. mgmp freezes the same
+// kind of write in Brain::UpdateDecision; this freezes it here: during an online
+// arena the brain's character keeps the facing it had before the update.
+#define RVA_PLAYERBRAIN_UPDATE 0x778DA0
+#define OFF_BRAIN_CHARACTER    0x38
+#define OFF_CHAR_FACING        0x388
+static const unsigned char kPlayerBrainUpdateEntry[11] = {
+    0x48,0x8B,0xC4, 0x55, 0x53, 0x56, 0x57, 0x41,0x54, 0x41,0x55 };
+typedef void (__fastcall *fn_brain_update)(void*);
+static fn_brain_update g_orig_pb_update;
+
+static void __fastcall hook_pb_update(void* brain) {
+    unsigned char* ch = NULL;
+    unsigned long long facing = 0;
+    if (g_arena_active && g_arena_online) {
+        __try {
+            ch = *(unsigned char**)((unsigned char*)brain + OFF_BRAIN_CHARACTER);
+            if (ch) facing = *(unsigned long long*)(ch + OFF_CHAR_FACING);
+        } __except (EXCEPTION_EXECUTE_HANDLER) { ch = NULL; }
+    }
+    if (ch) pvp_choice_fence(1);
+    g_orig_pb_update(brain);
+    if (ch) pvp_choice_fence(0);
+    if (ch) {
+        __try {
+            if (*(unsigned long long*)(ch + OFF_CHAR_FACING) != facing) {
+                static int said;
+                if (said++ < 5) plog("net: PlayerBrain update turned a cat -- facing put back");
+                *(unsigned long long*)(ch + OFF_CHAR_FACING) = facing;
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+}
+
+// Run 54 (online): turn 0 already disagreed on two cats' tile elements (bit 0x10):
+// the grass tiles themselves differed. A level's grass is rolled per tile when the
+// level loads (tiles.gon "Grass": GrassTile 80 / TallGrassTile 15 / BlankTile 5), and
+// that happens in FUN_14031E6E0 (the Battle scene's level load, called by the house-
+// battle start FUN_140319170 right after FUN_14094F0A0 re-seeds the sim stream its own
+// way) -- before Level::init, where the START's seed used to be set. So the seed now
+// goes in at the level load's entry too, during an online start.
+#define RVA_BATTLE_LEVEL_LOAD 0x31E6E0
+static const unsigned char kLevelLoadEntry[9] = { 0x40,0x53, 0x55, 0x41,0x56, 0x48,0x83,0xEC,0x50 };
+typedef void* (__fastcall *fn_level_load)(void*, void*, void*);
+static fn_level_load g_orig_level_load;
+
+static void* __fastcall hook_level_load(void* scene, void* a, void* path) {
+    if (g_spawning && g_online_seed_set) {
+        __try {
+            unsigned char* r = sim_rng();
+            if (r) { memcpy(r, g_online_seed, 32); plog("net: sim stream set from the START seed (level load)"); }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+    return g_orig_level_load(scene, a, path);
+}
+
 void pvp_init(HMODULE self) {
+    g_rw_self = self;
     char path[MAX_PATH];
     GetModuleFileNameA(self, path, MAX_PATH);
     char* slash = strrchr(path, '\\');
@@ -2185,11 +2625,19 @@ void pvp_init(HMODULE self) {
         g_bird_wave = GetPrivateProfileIntA("arena", "BirdWave", 1, ini);
     }
     find_modpath();
+    gd_start(plog);
+    detect_language(self);
+    lobby_set_english(g_en);
+    auto_init(self);
     lobby_set_log(plog);
-    plog("pvp arena (mgmp) v23 loaded, items %d/%d/%d, FreezeMs=%d, teams: '%s' vs '%s', TeamSize=%d",
+    plog("pvp arena (mgmp) v53 loaded, items %d/%d/%d, FreezeMs=%d, teams: '%s' vs '%s', TeamSize=%d",
          g_item_preset, g_items_per_cat, g_items_mirror, g_freeze_ms, g_team_room[0], g_team_room[1], g_team_max);
 
     if (!MJ_Require("pvp_probe") || !MJ_Resolve(&mj)) { plog("mewjector API missing"); return; }
+    auto_hooks();
+    intro_hooks(self);
+    face_hooks();
+    roll_x_hooks();
     // Setup first: a flipped cat must never reach battle setup unhooked.
     if (!hook(RVA_BATTLE_SETUP, kSetupEntry, 15, (void*)hook_battle_setup, (void**)&g_orig_setup, "battle setup"))
         return;
@@ -2218,6 +2666,813 @@ void pvp_init(HMODULE self) {
     hook(RVA_GEN_CATS, kGenCatsEntry, 15, (void*)hook_gen_cats, (void**)&g_orig_gen_cats,
          "DebugGenAdventureCats");
     pvp_clone_init();
+    hook(RVA_BATTLE_LEVEL_LOAD, kLevelLoadEntry, 9, (void*)hook_level_load, (void**)&g_orig_level_load,
+         "Battle level load (online seed)");
+    hook(RVA_PLAYERBRAIN_UPDATE, kPlayerBrainUpdateEntry, 11, (void*)hook_pb_update, (void**)&g_orig_pb_update,
+         "PlayerBrain update (facing freeze, online)");
     // StatusMenu::update (the portrait panel): mgmp's h_StatusMenu calls
     // pvp_status_menu_begin / _end around the original.
+}
+
+// ---------------------------------------------------------------------------
+// Online (mgmp net.mode = "pvp"). Two players, each in their OWN house.
+//
+// Lobby: whoever presses АРЕНА opens it on both machines (LOBBY_OPEN). Each player
+// picks cats from their own house -- the host for team 1, the client for team 2 --
+// and both keep sending what they picked (PICK: lobby rows for display plus each
+// cat's SerializeCatData bytes). The host's rules win (SETTINGS). Either can cancel
+// (LOBBY_CLOSE).
+//
+// Start: only the host. It builds the fight's whole input once -- the level file
+// (cover / loot / monsters / birds already placed), a 32-byte sim-stream seed, a
+// battle id, every fighter's bytes in order, every fighter's item kit -- sends it
+// (START) and then applies exactly the same bytes itself through arena_online_apply,
+// which is all the client does too. So both machines build byte-identical clones,
+// load the same level, start Level::init from the same sim stream and give mgmp's
+// lockstep the same battle id; the control split goes by team (host = team 1).
+//
+// РЕВАНШ: the host rebuilds the input (new level, seed, id, kits; same fighters) and
+// sends a START with the rematch flag; a client's РЕВАНШ is a request to the host.
+// ДОМОЙ: either side, both go home (ACTION).
+
+enum { SUB_LOBBY_OPEN = 1, SUB_LOBBY_CLOSE = 2, SUB_SETTINGS = 3, SUB_PICK = 4, SUB_START = 5, SUB_ACTION = 6 };
+enum { NETACT_REMATCH = 1, NETACT_HOME = 2 };
+#define NET_MAX_SIDE 4
+#define NET_MAX_FIGHTERS (2 * NET_MAX_SIDE)
+
+typedef struct { unsigned char* p; uint32_t n, cap; int ok; } wbuf;
+static void wb_put(wbuf* b, const void* d, uint32_t n) {
+    if (!b->ok) return;
+    if (b->n + n > b->cap) {
+        uint32_t c = b->cap ? b->cap * 2 : 4096;
+        while (c < b->n + n) c *= 2;
+        unsigned char* q = (unsigned char*)realloc(b->p, c);
+        if (!q) { b->ok = 0; return; }
+        b->p = q; b->cap = c;
+    }
+    memcpy(b->p + b->n, d, n);
+    b->n += n;
+}
+static void wb_u8(wbuf* b, unsigned v)   { unsigned char c = (unsigned char)v; wb_put(b, &c, 1); }
+static void wb_u32(wbuf* b, uint32_t v)  { wb_put(b, &v, 4); }
+static void wb_u64(wbuf* b, uint64_t v)  { wb_put(b, &v, 8); }
+
+typedef struct { const unsigned char* p; uint32_t n, pos; int ok; } rbuf;
+static const unsigned char* rb_ptr(rbuf* r, uint32_t n) {
+    if (!r->ok || r->pos + n > r->n) { r->ok = 0; return NULL; }
+    const unsigned char* q = r->p + r->pos;
+    r->pos += n;
+    return q;
+}
+static void rb_get(rbuf* r, void* d, uint32_t n) {
+    const unsigned char* q = rb_ptr(r, n);
+    if (q) memcpy(d, q, n); else memset(d, 0, n);
+}
+static uint32_t rb_u8(rbuf* r)  { unsigned char c; rb_get(r, &c, 1); return c; }
+static uint32_t rb_u32(rbuf* r) { uint32_t v; rb_get(r, &v, 4); return v; }
+static uint64_t rb_u64(rbuf* r) { uint64_t v; rb_get(r, &v, 8); return v; }
+
+static uint64_t fnv64(const void* p, uint32_t n, uint64_t h) {
+    const unsigned char* b = (const unsigned char*)p;
+    for (uint32_t i = 0; i < n; i++) { h ^= b[i]; h *= 0x100000001B3ULL; }
+    return h;
+}
+static uint64_t rnd64(void) { return ((uint64_t)rnd(0x7FFFFFFF) << 33) ^ ((uint64_t)rnd(0x7FFFFFFF) << 2) ^ rnd(4); }
+
+// The fight's per-fight deterministic RNG (bird rewards): seeded from START.
+static uint64_t g_fight_rng;
+static unsigned int rnd_fight(unsigned int n) {
+    if (!g_online_seed_set) return rnd(n);
+    g_fight_rng ^= g_fight_rng << 13; g_fight_rng ^= g_fight_rng >> 7; g_fight_rng ^= g_fight_rng << 17;
+    return n ? (unsigned int)(g_fight_rng % n) : 0;
+}
+
+// What the other player picked (their PICK), and what the last START fought with.
+static lobby_cat      g_remote[NET_MAX_SIDE];
+static unsigned char* g_remote_bytes[NET_MAX_SIDE];
+static uint32_t       g_remote_len[NET_MAX_SIDE];
+static int            g_remote_n;
+static char           g_remote_name[32];
+
+static lobby_cat      g_fight_rows[NET_MAX_FIGHTERS];
+static unsigned char* g_fight_bytes[NET_MAX_FIGHTERS];
+static uint32_t       g_fight_len[NET_MAX_FIGHTERS];
+static int            g_fight_n1, g_fight_n2;
+static lobby_settings g_fight_settings;
+
+static uint64_t           g_pick_sent_hash, g_set_sent_hash;
+static unsigned long long g_sync_at;
+static int                g_lobby_announce = 1;
+
+static void net_reset_sync(void) { g_pick_sent_hash = g_set_sent_hash = 0; g_sync_at = 0; }
+
+static void net_send_pick_and_rules(void) {
+    lobby_cat mine[LOBBY_MAX_CATS];
+    char name[32];
+    lobby_settings s;
+    int n = lobby_get_local(mine, name, &s);
+    if (n > NET_MAX_SIDE) n = NET_MAX_SIDE;
+    uint64_t h = fnv64(name, 32, 0xCBF29CE484222325ULL);
+    h = fnv64(&n, sizeof n, h);
+    for (int i = 0; i < n; i++) {
+        h = fnv64(&mine[i].key, sizeof mine[i].key, h);
+        h = fnv64(mine[i].kit, sizeof mine[i].kit, h);
+    }
+    uint64_t hs = fnv64(&s, sizeof s, 0xCBF29CE484222325ULL);
+    unsigned long long now = GetTickCount64();
+    int periodic = now >= g_sync_at;   // a peer that opened its lobby late still hears us
+    if (h != g_pick_sent_hash || periodic) {
+        wbuf b = { NULL, 0, 0, 1 };
+        wb_put(&b, name, 32);
+        wb_u8(&b, (unsigned)n);
+        for (int i = 0; i < n; i++) {
+            uint8_t* bytes = NULL;
+            uint32_t len = pvp_clone_serialize(mine[i].cat, &bytes);
+            wb_put(&b, &mine[i], sizeof(lobby_cat));
+            wb_u32(&b, len);
+            if (len) wb_put(&b, bytes, len);
+            free(bytes);
+        }
+        if (b.ok && pvp_net_send(SUB_PICK, b.p, b.n)) g_pick_sent_hash = h;
+        free(b.p);
+    }
+    if (pvp_net_mode() == 1 && (hs != g_set_sent_hash || periodic)) {
+        if (pvp_net_send(SUB_SETTINGS, &s, sizeof s)) g_set_sent_hash = hs;
+    }
+    if (periodic) g_sync_at = now + 2000;
+}
+
+static void net_on_pick(const unsigned char* data, uint32_t size) {
+    rbuf r = { data, size, 0, 1 };
+    char name[32];
+    rb_get(&r, name, 32);
+    name[31] = 0;
+    int n = (int)rb_u8(&r);
+    if (n > NET_MAX_SIDE) { plog("net: !! PICK with %d cats -- ignored", n); return; }
+    lobby_cat rows[NET_MAX_SIDE];
+    const unsigned char* bytes[NET_MAX_SIDE];
+    uint32_t len[NET_MAX_SIDE];
+    for (int i = 0; i < n; i++) {
+        rb_get(&r, &rows[i], sizeof(lobby_cat));
+        len[i] = rb_u32(&r);
+        bytes[i] = len[i] ? rb_ptr(&r, len[i]) : NULL;
+    }
+    if (!r.ok) { plog("net: !! PICK did not parse"); return; }
+    for (int i = 0; i < g_remote_n; i++) { free(g_remote_bytes[i]); g_remote_bytes[i] = NULL; }
+    for (int i = 0; i < n; i++) {
+        g_remote[i] = rows[i];
+        g_remote[i].cat = NULL;   // a pointer into the other process
+        g_remote_len[i] = 0;
+        g_remote_bytes[i] = len[i] ? (unsigned char*)malloc(len[i]) : NULL;
+        if (g_remote_bytes[i]) { memcpy(g_remote_bytes[i], bytes[i], len[i]); g_remote_len[i] = len[i]; }
+    }
+    g_remote_n = n;
+    memcpy(g_remote_name, name, 32);
+    lobby_set_remote(name, g_remote, n);
+}
+
+// Item kits for the fighters, rolled by the host (the client never rolls).
+static void roll_kits(const lobby_settings* s, int n1, int n2, char kits[][NUM_SLOTS][48]) {
+    memset(kits, 0, sizeof(char) * NET_MAX_FIGHTERS * NUM_SLOTS * 48);
+    if (s->item_preset == PRESET_NONE) return;
+    if (s->item_preset == PRESET_HOUSE) {
+        // Online "Из дома": each player dressed their own cats from their own
+        // storage in the lobby; the kits came with the rows (the host's own, and
+        // the client's in its PICK). Built by name on both machines, so neither
+        // house loses anything.
+        for (int i = 0; i < n1 + n2; i++)
+            for (int sl = 0; sl < NUM_SLOTS; sl++) {
+                strncpy(kits[i][sl], g_fight_rows[i].kit[sl], 47);
+                kits[i][sl][47] = 0;
+            }
+        return;
+    }
+    int mirror = s->item_preset == PRESET_BALANCED;
+    int per = s->items_per_cat < 1 ? 1 : s->items_per_cat > NUM_SLOTS ? NUM_SLOTS : s->items_per_cat;
+    for (int i = 0; i < n1 + n2; i++) {
+        if (mirror && i >= n1 && i - n1 < n1) { memcpy(kits[i], kits[i - n1], sizeof kits[i]); continue; }
+        int order[NUM_SLOTS] = { 0, 1, 2, 3, 4 };
+        for (int k = NUM_SLOTS - 1; k > 0; k--) { int j = rnd(k + 1); int t = order[k]; order[k] = order[j]; order[j] = t; }
+        for (int k = 0; k < per; k++) {
+            int sl = order[k];
+            int pool = gd_slot_count(sl);
+            if (!pool) continue;
+            strncpy(kits[i][sl], gd_slot_item(sl, (int)rnd(pool)), 47);
+        }
+    }
+}
+
+static int split_owner(const void* character) {
+    __try {
+        void* cat = *(void**)((const unsigned char*)character + OFF_CATDATA);
+        int t = cat ? team_of_cat(cat) : 0;
+        return t == 1 ? 0 : t == 2 ? 1 : -1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
+static void arena_online_apply(const unsigned char* data, uint32_t size);
+
+// Host: build the fight's input, send it, apply it here too.
+static void host_start(int rematch) {
+    lobby_settings* s = &g_fight_settings;
+    // The level: placed with the host's rules, then shipped as bytes.
+    g_level_fixed[0] = 0;
+    g_cover_count = s->cover_count; g_cover_kind = s->cover_kind;
+    g_loot_count = s->loot_count;   g_loot_mask = s->loot_mask;
+    g_mob_count = s->mob_count;     g_mob_kind = s->mob_kind;
+    g_bird_count = s->bird_count;   g_bird_mask = s->bird_mask;
+    const char* lvl = arena_level_for_fight();
+    char path[MAX_PATH];
+    _snprintf(path, MAX_PATH, "%s\\levels\\%s", g_modpath, lvl);
+    for (char* c = path; *c; c++) if (*c == '/') *c = '\\';
+    unsigned char* lvl_bytes = NULL;
+    uint32_t lvl_len = 0;
+    FILE* f = fopen(path, "rb");
+    if (f) {
+        fseek(f, 0, SEEK_END);
+        long n = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        if (n > 0 && n < 1 << 20 && (lvl_bytes = (unsigned char*)malloc(n)) && fread(lvl_bytes, 1, n, f) == (size_t)n) lvl_len = (uint32_t)n;
+        fclose(f);
+    }
+    if (!lvl_len) { plog("net: !! cannot read the level %s -- not starting", path); free(lvl_bytes); return; }
+
+    char kits[NET_MAX_FIGHTERS][NUM_SLOTS][48];
+    roll_kits(s, g_fight_n1, g_fight_n2, kits);
+    unsigned char seed[32];
+    for (int i = 0; i < 4; i++) { uint64_t v = rnd64(); memcpy(seed + 8 * i, &v, 8); }
+    uint64_t battle_id = rnd64() | 1;
+
+    wbuf b = { NULL, 0, 0, 1 };
+    wb_u8(&b, rematch ? 1 : 0);
+    wb_put(&b, s, sizeof *s);
+    wb_u64(&b, battle_id);
+    wb_put(&b, seed, 32);
+    wb_u32(&b, lvl_len);
+    wb_put(&b, lvl_bytes, lvl_len);
+    wb_u8(&b, (unsigned)g_fight_n1);
+    wb_u8(&b, (unsigned)g_fight_n2);
+    for (int i = 0; i < g_fight_n1 + g_fight_n2; i++) {
+        wb_put(&b, &g_fight_rows[i], sizeof(lobby_cat));
+        wb_u32(&b, g_fight_len[i]);
+        wb_put(&b, g_fight_bytes[i], g_fight_len[i]);
+        wb_put(&b, kits[i], sizeof kits[i]);
+    }
+    free(lvl_bytes);
+    if (!b.ok) { plog("net: !! START did not build"); free(b.p); return; }
+    int sent = pvp_net_send(SUB_START, b.p, b.n);
+    plog("net: START %s (%u bytes, battle %016llx, %d vs %d) %s", rematch ? "rematch" : "fight", b.n,
+         (unsigned long long)battle_id, g_fight_n1, g_fight_n2, sent ? "sent" : "NOT SENT");
+    if (sent) arena_online_apply(b.p, b.n);
+    free(b.p);
+}
+
+// Host pressed СТАРТ in the online lobby: fix the fighters (own picks + the remote's).
+static void host_start_from_lobby(const lobby_cat* own, int n_own, const lobby_settings* s) {
+    for (int i = 0; i < g_fight_n1 + g_fight_n2; i++) { free(g_fight_bytes[i]); g_fight_bytes[i] = NULL; }
+    g_fight_n1 = g_fight_n2 = 0;
+    g_fight_settings = *s;
+    int k = 0;
+    for (int i = 0; i < n_own && g_fight_n1 < NET_MAX_SIDE; i++) {
+        if (own[i].team != 1) continue;
+        uint8_t* bytes = NULL;
+        uint32_t len = pvp_clone_serialize(own[i].cat, &bytes);
+        if (!len) { plog("net: !! could not serialize %s", own[i].name); continue; }
+        g_fight_rows[k] = own[i]; g_fight_rows[k].cat = NULL;
+        g_fight_bytes[k] = bytes; g_fight_len[k] = len;
+        k++; g_fight_n1++;
+    }
+    for (int i = 0; i < g_remote_n && g_fight_n2 < NET_MAX_SIDE; i++) {
+        if (!g_remote_len[i]) continue;
+        g_fight_rows[k] = g_remote[i];
+        g_fight_bytes[k] = (unsigned char*)malloc(g_remote_len[i]);
+        if (!g_fight_bytes[k]) continue;
+        memcpy(g_fight_bytes[k], g_remote_bytes[i], g_remote_len[i]);
+        g_fight_len[k] = g_remote_len[i];
+        k++; g_fight_n2++;
+    }
+    if (!g_fight_n1 || !g_fight_n2) { plog("net: !! start with %d vs %d cats -- not starting", g_fight_n1, g_fight_n2); return; }
+    host_start(0);
+}
+
+// Both machines: build the fight from a START, identically.
+static void arena_online_apply(const unsigned char* data, uint32_t size) {
+    rbuf r = { data, size, 0, 1 };
+    int rematch = (int)rb_u8(&r);
+    lobby_settings s;
+    rb_get(&r, &s, sizeof s);
+    uint64_t battle_id = rb_u64(&r);
+    unsigned char seed[32];
+    rb_get(&r, seed, 32);
+    uint32_t lvl_len = rb_u32(&r);
+    const unsigned char* lvl = rb_ptr(&r, lvl_len);
+    int n1 = (int)rb_u8(&r), n2 = (int)rb_u8(&r);
+    if (!r.ok || n1 < 1 || n2 < 1 || n1 > NET_MAX_SIDE || n2 > NET_MAX_SIDE) { plog("net: !! START did not parse"); return; }
+    lobby_cat rows[NET_MAX_FIGHTERS];
+    const unsigned char* bytes[NET_MAX_FIGHTERS];
+    uint32_t blen[NET_MAX_FIGHTERS];
+    char kits[NET_MAX_FIGHTERS][NUM_SLOTS][48];
+    for (int i = 0; i < n1 + n2; i++) {
+        rb_get(&r, &rows[i], sizeof(lobby_cat));
+        blen[i] = rb_u32(&r);
+        bytes[i] = rb_ptr(&r, blen[i]);
+        rb_get(&r, kits[i], sizeof kits[i]);
+    }
+    if (!r.ok) { plog("net: !! START fighters did not parse"); return; }
+    if (rematch && !g_arena_active) { plog("net: rematch START outside an arena -- ignored"); return; }
+    if (!rematch && g_arena_active) { plog("net: START while an arena is on -- ignored"); return; }
+    unsigned char* house = rematch ? NULL : find_house_scene();
+    unsigned char* md = *(unsigned char**)((unsigned char*)GetModuleHandleA(NULL) + RVA_MEWDIRECTOR_PTR);
+    unsigned char* battle = rematch ? find_scene("Battle") : NULL;
+    if (!md || (!rematch && !house) || (rematch && !battle)) { plog("net: !! START but no house / battle / MewDirector"); return; }
+
+    // The level, byte for byte.
+    char path[MAX_PATH];
+    _snprintf(path, MAX_PATH, "%s\\levels\\pvp\\g.lvl", g_modpath);
+    FILE* f = fopen(path, "wb");
+    if (!f) { plog("net: !! cannot write %s", path); return; }
+    fwrite(lvl, 1, lvl_len, f);
+    fclose(f);
+    strcpy(g_level_fixed, "pvp/g.lvl");
+
+    // The rules that act during the fight.
+    memcpy(g_player_name, s.player_name, sizeof g_player_name);
+    g_money_on = s.money_on; g_money = s.money;
+    g_mob_count = s.mob_count; g_mob_kind = s.mob_kind; g_mob_mode = s.mob_mode; g_mob_mad = s.mob_mad;
+    g_bird_count = s.bird_count; g_bird_mask = s.bird_mask; g_bird_every = s.bird_every; g_bird_wave = s.bird_wave;
+    g_item_preset = PRESET_HOUSE;   // every kit is fixed by the host: the "picked" path builds them
+    g_house_picked = 1;
+
+    // The fighters: clones from the shipped bytes, team 1 first.
+    restore_items();                // the previous fight's arena items off the clone objects first
+    pvp_clone_clear();
+    g_cat_snap_count = 0;
+    g_team_size[0] = g_team_size[1] = 0;
+    for (int i = 0; i < n1 + n2; i++) {
+        int t = i < n1 ? 0 : 1;
+        void* clone = pvp_clone_from_bytes(i, bytes[i], blen[i]);
+        if (!clone) { plog("net: !! clone %d (%s) failed -- not starting", i, rows[i].name); return; }
+        // Run 51: the two houses are on different days, and a cat's age (life stage,
+        // so its stats) is the house's current day minus the cat's birthday. The
+        // owner's age rides in the row; the birthday is re-based on this machine's day.
+        __try {
+            long long today = *(long long*)(md + 0x580);
+            *(long long*)((unsigned char*)clone + 0xC38) = today - rows[i].age_days;
+        } __except (EXCEPTION_EXECUTE_HANDLER) { plog("net: !! could not re-base the age of clone %d", i); }
+        memcpy(g_pick_kit[g_cat_snap_count], kits[i], sizeof kits[i]);
+        snapshot_cat((unsigned char*)clone, t, g_team_size[t]);
+        g_team_size[t]++;
+        plog("net: fighter %d team %d %s (%u bytes)", i, t + 1, rows[i].name, blen[i]);
+    }
+
+    memcpy(g_online_seed, seed, 32);
+    g_online_seed_set = 1;
+    g_fight_rng = fnv64(seed, 32, 0xCBF29CE484222325ULL) | 1;
+    g_arena_online = 1;
+    pvp_lockstep_split(split_owner);
+    pvp_lockstep_enter(battle_id);
+    plog("net: %s battle %016llx, %d vs %d, seed %02x%02x%02x%02x...", rematch ? "rematch" : "start",
+         (unsigned long long)battle_id, n1, n2, seed[0], seed[1], seed[2], seed[3]);
+
+    if (rematch) {
+        g_end_at = 0;
+        g_banner_ent = NULL;
+        g_freeze_at = 0;
+        apply_items();
+        start_fight(battle, 0);
+    } else {
+        if (lobby_is_open()) lobby_close();
+        start_arena_with_teams(house, md);
+    }
+}
+
+// --- the hooks into the hotseat code -----------------------------------------
+
+static int net_open_lobby(const lobby_cat* cats, int n, const lobby_settings* s) {
+    int mode = pvp_net_mode();
+    if (!mode) return 0;
+    lobby_open_online(cats, n, s, mode == 1);
+    if (g_remote_n) lobby_set_remote(g_remote_name, g_remote, g_remote_n);
+    net_reset_sync();
+    if (g_lobby_announce) pvp_net_send(SUB_LOBBY_OPEN, NULL, 0);
+    plog("net: lobby opened online as %s%s", mode == 1 ? "host" : "client", g_lobby_announce ? "" : " (asked by the other player)");
+    return 1;
+}
+
+static int net_lobby_tick(void) {
+    if (lobby_take_cancel()) {
+        pvp_net_send(SUB_LOBBY_CLOSE, NULL, 0);
+        plog("net: lobby cancelled here -- told the other player");
+        return 1;
+    }
+    if (!lobby_is_online()) return 0;
+    if (!pvp_net_mode()) { plog("net: session gone -- closing the online lobby"); lobby_close(); return 1; }
+    if (lobby_is_open()) net_send_pick_and_rules();
+    static lobby_cat chosen[LOBBY_MAX_CATS];
+    int n = 0;
+    lobby_settings s;
+    if (pvp_net_mode() == 1 && lobby_take_start(chosen, &n, &s)) host_start_from_lobby(chosen, n, &s);
+    return 1;
+}
+
+static int net_route_action(long a) {
+    int mode = g_arena_online ? pvp_net_mode() : 0;
+    if (!mode || !g_arena_active) return 0;
+    if (a == ACT_REMATCH) {
+        if (mode == 1) host_start(1);
+        else { unsigned char v = NETACT_REMATCH; pvp_net_send(SUB_ACTION, &v, 1); plog("net: rematch asked of the host"); }
+        return 1;
+    }
+    if (a == ACT_HOME) {
+        unsigned char v = NETACT_HOME;
+        pvp_net_send(SUB_ACTION, &v, 1);
+        InterlockedExchange(&g_pending_exit, 1);
+        return 1;
+    }
+    return 0;
+}
+
+static int net_end_choice(int rematch) {
+    if (!g_arena_online || !pvp_net_mode()) return 0;
+    InterlockedExchange(&g_pending_action, rematch ? ACT_REMATCH : ACT_HOME);
+    return 1;
+}
+
+void pvp_on_message(uint8_t from, uint8_t sub, const uint8_t* data, uint32_t size) {
+    __try {
+        switch (sub) {
+            case SUB_LOBBY_OPEN:
+                if (!lobby_is_open() && !g_arena_active && find_house_scene()) {
+                    g_lobby_announce = 0;
+                    open_lobby();
+                    g_lobby_announce = 1;
+                }
+                break;
+            case SUB_LOBBY_CLOSE:
+                if (lobby_is_open() && lobby_is_online()) { lobby_close(); plog("net: the other player closed the lobby"); }
+                break;
+            case SUB_SETTINGS:
+                if (size == sizeof(lobby_settings) && pvp_net_mode() == 2 && lobby_is_online())
+                    lobby_set_settings((const lobby_settings*)data);
+                break;
+            case SUB_PICK:
+                net_on_pick(data, size);
+                break;
+            case SUB_START:
+                if (pvp_net_mode() == 2) arena_online_apply(data, size);
+                break;
+            case SUB_ACTION:
+                if (size >= 1 && data[0] == NETACT_HOME && g_arena_active) {
+                    plog("net: the other player went home");
+                    InterlockedExchange(&g_pending_exit, 1);
+                } else if (size >= 1 && data[0] == NETACT_REMATCH && pvp_net_mode() == 1 && g_arena_active) {
+                    plog("net: the client asks for a rematch");
+                    host_start(1);
+                }
+                break;
+            default:
+                plog("net: unknown arena message %u from peer %u (%u bytes)", (unsigned)sub, (unsigned)from, size);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        plog("net: !! fault handling arena message %u", (unsigned)sub);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Auto mode (pvp.ini [auto] Enabled=1): unattended online fights for soak
+// testing. Both peers run it. The host opens the lobby, rolls random rules and
+// starts once both sides have auto-picked their cats; the client only picks. In
+// the fight the game's AI decides for each peer's own cats (mgmp's GetChoice hook,
+// pvp_auto_on). After a fight the host starts a rematch with freshly rolled
+// rules, and every HomeEvery fights goes home for new cats. Each event is a line
+// in pvp_auto.log; a halted lockstep stops the loop (the soak script collects the
+// logs and restarts both copies).
+static int                g_auto, g_auto_home_every = 3, g_auto_fight_minutes = 12;
+static FILE*              g_auto_log;
+static unsigned long long g_auto_t, g_auto_fight_t0, g_auto_end_seen;
+static int                g_auto_fights, g_auto_since_home, g_auto_halted, g_auto_rolled, g_auto_in_fight;
+static int                g_auto_dress_tried;   // once per lobby: an empty storage stays empty
+
+static void alog(const char* fmt, ...) {
+    if (!g_auto_log) return;
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    fprintf(g_auto_log, "%02d:%02d:%02d ", st.wHour, st.wMinute, st.wSecond);
+    va_list ap; va_start(ap, fmt);
+    vfprintf(g_auto_log, fmt, ap);
+    va_end(ap);
+    fputc('\n', g_auto_log);
+    fflush(g_auto_log);
+}
+
+static void auto_init(HMODULE self) {
+    char ini[MAX_PATH];
+    pvp_ini_path(self, ini);
+    g_auto = GetPrivateProfileIntA("auto", "Enabled", 0, ini);
+    g_rw_enabled = GetPrivateProfileIntA("debug", "Watch", 0, ini);
+    g_auto_home_every = GetPrivateProfileIntA("auto", "HomeEvery", 3, ini);
+    g_auto_fight_minutes = GetPrivateProfileIntA("auto", "FightMinutes", 12, ini);
+    if (!g_auto) return;
+    char path[MAX_PATH];
+    GetModuleFileNameA(self, path, MAX_PATH);
+    char* slash = strrchr(path, '\\');
+    if (slash) strcpy(slash + 1, "pvp_auto.log");
+    g_auto_log = fopen(path, "a");
+    alog("=== auto mode on (home every %d fight(s), fight limit %d min)", g_auto_home_every, g_auto_fight_minutes);
+}
+
+static const char* const kPresetNames[] = { "none", "random", "house", "balanced" };
+
+static void auto_roll(lobby_settings* s, int keep_team) {
+    static const int kPresets[4] = { PRESET_NONE, PRESET_RANDOM, PRESET_HOUSE, PRESET_BALANCED };
+    if (!keep_team) s->team_max = 1 + (int)rnd(4);
+    // A rematch keeps the cats, and the house kits were dressed in the lobby: it
+    // keeps "Из дома" only if the lobby had it.
+    if (!keep_team) s->item_preset = kPresets[rnd(4)];
+    else if (s->item_preset != PRESET_HOUSE) s->item_preset = kPresets[(int[]){0, 1, 3}[rnd(3)]];
+    s->items_per_cat = 1 + (int)rnd(5);
+    s->money_on = (int)rnd(2);
+    s->money = 10 * (int)rnd(6);
+    s->cover_count = 2 * (int)rnd(7);
+    s->cover_kind = (int)rnd(3);
+    s->loot_count = (int)rnd(11);
+    s->loot_mask = 1 + (int)rnd(15);
+    s->mob_count = (int)rnd(7);
+    s->mob_kind = (int)rnd(3);
+    s->mob_mode = (int)rnd(2);
+    s->mob_mad = (int)rnd(2);
+    s->bird_count = (int)rnd(5);
+    s->bird_mask = 1 + (int)rnd(7);
+    s->bird_every = (int)rnd(4);        // 0 = only the starting birds
+    s->bird_wave = 1 + (int)rnd(3);
+}
+
+static void auto_describe(const lobby_settings* s, char* out, size_t n) {
+    _snprintf(out, n, "%dv%d items %s x%d money %s%d cover %d/k%d loot %d/m%d mobs %d/k%d/mode%d%s birds %d/m%d waves every %d x%d",
+              s->team_max, s->team_max, kPresetNames[s->item_preset & 3], s->items_per_cat,
+              s->money_on ? "" : "off/", s->money, s->cover_count, s->cover_kind, s->loot_count, s->loot_mask,
+              s->mob_count, s->mob_kind, s->mob_mode, s->mob_mad ? "/mad" : "", s->bird_count, s->bird_mask,
+              s->bird_every, s->bird_wave);
+}
+
+int pvp_auto_on(void) {
+    return g_auto && g_arena_online && g_arena_active && !g_auto_halted;
+}
+
+static void auto_tick(void) {
+    if (!g_auto) return;
+    int mode = pvp_net_mode();
+    if (!mode) return;
+    unsigned long long now = GetTickCount64();
+    if (pvp_lockstep_halted()) {
+        if (!g_auto_halted) { alog("HALT in fight %d -- auto mode stopped", g_auto_fights); g_auto_halted = 1; }
+        return;
+    }
+    if (g_auto_halted || now < g_auto_t) return;
+
+    // The lobby: rules (host), picks (both), start (host).
+    if (lobby_is_open() && lobby_is_online()) {
+        lobby_cat mine[LOBBY_MAX_CATS];
+        char name[32];
+        lobby_settings s;
+        int n = lobby_get_local(mine, name, &s);
+        if (mode == 1 && !g_auto_rolled) {
+            auto_roll(&s, 0);
+            lobby_set_settings(&s);
+            g_auto_rolled = 1;
+            g_auto_t = now + 1000;
+            return;
+        }
+        if (n != s.team_max) { lobby_auto_pick((unsigned)rnd(0x7FFFFFFF)); g_auto_t = now + 1500; return; }
+        if (s.item_preset == PRESET_HOUSE) {   // dress this side's cats from this house
+            int any = 0;
+            for (int k = 0; k < n && !any; k++)
+                for (int sl = 0; sl < NUM_SLOTS; sl++) if (mine[k].kit[sl][0]) { any = 1; break; }
+            if (!any && !g_auto_dress_tried) { g_auto_dress_tried = 1; lobby_auto_kits(); g_auto_t = now + 1500; return; }
+        }
+        static unsigned long long announced;
+        if (mode == 1 && g_remote_n == 0 && now - announced > 8000) {   // the client may have missed it
+            announced = now;
+            pvp_net_send(SUB_LOBBY_OPEN, NULL, 0);
+        }
+        if (mode == 1 && g_remote_n == s.team_max && s.item_preset == PRESET_HOUSE) {
+            // The client dresses after it has picked; its kits arrive in a later PICK.
+            static unsigned long long wait_from;
+            int dressed = 0;
+            for (int k = 0; k < g_remote_n && !dressed; k++)
+                for (int sl = 0; sl < NUM_SLOTS; sl++) if (g_remote[k].kit[sl][0]) { dressed = 1; break; }
+            if (!wait_from) wait_from = now;
+            if (!dressed && now - wait_from < 10000) { g_auto_t = now + 1000; return; }
+            wait_from = 0;
+        }
+        if (mode == 1 && g_remote_n == s.team_max) {
+            char d[256];
+            auto_describe(&s, d, sizeof d);
+            alog("fight %d: new cats, %s", g_auto_fights + 1, d);
+            host_start_from_lobby(mine, n, &s);
+            g_auto_t = now + 5000;
+        }
+        return;
+    }
+
+    if (g_arena_active) {
+        if (!g_auto_in_fight) {
+            g_auto_in_fight = 1;
+            g_auto_fight_t0 = now;
+            g_auto_end_seen = 0;
+            g_auto_fights++;
+            alog("fight %d started (%s)", g_auto_fights, mode == 1 ? "host" : "client");
+        }
+        if (g_end_at && !g_auto_end_seen) {
+            g_auto_end_seen = now;
+            alog("fight %d over after %llu s", g_auto_fights, (now - g_auto_fight_t0) / 1000);
+        }
+        if (mode != 1) return;
+        int timed_out = !g_end_at && now - g_auto_fight_t0 > (unsigned long long)g_auto_fight_minutes * 60000ULL;
+        if ((g_auto_end_seen && now - g_auto_end_seen > 4000) || timed_out) {
+            if (timed_out) alog("fight %d hit the %d min limit", g_auto_fights, g_auto_fight_minutes);
+            g_auto_in_fight = 0;
+            if (++g_auto_since_home < g_auto_home_every) {
+                auto_roll(&g_fight_settings, 1);
+                char d[256];
+                auto_describe(&g_fight_settings, d, sizeof d);
+                alog("fight %d: rematch, %s", g_auto_fights + 1, d);
+                host_start(1);
+            } else {
+                g_auto_since_home = 0;
+                alog("going home for new cats");
+                net_end_choice(0);
+            }
+            g_auto_t = now + 6000;
+        }
+        return;
+    }
+    g_auto_in_fight = 0;
+
+    // The house: the host opens the lobby (and re-announces it above if the client
+    // missed the first one); a client that arrives in the house later opens its
+    // own, which asks the host to open one too.
+    if (mode == 2 && find_house_scene() && !lobby_is_open()) {
+        g_auto_dress_tried = 0;
+        open_lobby();
+        g_auto_t = now + 5000;
+        return;
+    }
+    if (mode == 1 && find_house_scene() && !lobby_is_open()) {
+        for (int i = 0; i < g_remote_n; i++) { free(g_remote_bytes[i]); g_remote_bytes[i] = NULL; }
+        g_remote_n = 0;   // last lobby's picks must not start this one
+        g_auto_rolled = 0;
+        g_auto_dress_tried = 0;
+        open_lobby();
+        g_auto_t = now + 3000;
+    }
+}
+
+// Auto mode, getting in: the game boots to the main menu. Play is pressed through
+// Button::Click (RVA 0x97E8E0, force 0 -- what Button::update itself does; the
+// button's name is the std::string at Button+504), and on the save screen slot 0
+// is continued through SaveSelection::ContinueSlot (RVA 0x1BD8B0) from a hook on
+// SaveSelection::update (RVA 0x1BB780), installed only in auto mode.
+#define RVA_BUTTON_CLICK   0x97E8E0
+#define RVA_SAVESEL_UPDATE 0x1BB780
+#define RVA_SAVESEL_SLOT   0x1BD8B0
+#define OFF_BUTTON_NAME    504
+static const unsigned char kSaveSelUpdateEntry[11] = { 0x48,0x8B,0xC4, 0x55, 0x53, 0x56, 0x57, 0x41,0x54, 0x41,0x55 };
+typedef void (__fastcall *fn_savesel_update)(void*);
+typedef void (__fastcall *fn_savesel_slot)(void*, int, unsigned char);
+typedef void (__fastcall *fn_button_click)(void*, unsigned char);
+static fn_savesel_update  g_orig_savesel_update;
+static unsigned long long g_auto_click_at, g_auto_savesel_seen;
+
+static void auto_button(unsigned char* btn) {
+    if (!g_auto || !btn) return;
+    unsigned long long now = GetTickCount64();
+    if (now < g_auto_click_at) return;
+    char name[64];
+    __try {
+        if (!read_std_string(btn + OFF_BUTTON_NAME, name, sizeof name)) return;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return; }
+    if (strcmp(name, "MainMenu_Button_Play") != 0) return;
+    g_auto_click_at = now + 4000;
+    alog("main menu: pressing Play");
+    __try {
+        ((fn_button_click)((unsigned char*)GetModuleHandleA(NULL) + RVA_BUTTON_CLICK))(btn, 0);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { alog("!! fault pressing Play"); }
+}
+
+static void __fastcall hook_savesel_update(void* ss) {
+    g_orig_savesel_update(ss);
+    unsigned long long now = GetTickCount64();
+    if (!g_auto_savesel_seen || now - g_auto_savesel_seen > 30000) { g_auto_savesel_seen = now; return; }
+    if (now - g_auto_savesel_seen < 1500) return;   // let the screen settle first
+    g_auto_savesel_seen = now + 30000;              // once per visit
+    alog("save screen: continuing slot 0");
+    __try {
+        ((fn_savesel_slot)((unsigned char*)GetModuleHandleA(NULL) + RVA_SAVESEL_SLOT))(ss, 0, 0);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { alog("!! fault continuing slot 0"); }
+}
+
+static void auto_hooks(void) {
+    if (!g_auto) return;
+    hook(RVA_SAVESEL_UPDATE, kSaveSelUpdateEntry, 11, (void*)hook_savesel_update, (void**)&g_orig_savesel_update,
+         "SaveSelection::update (auto mode)");
+}
+
+// The game's opening cutscene ("game_intro", started by GameBase::init unless the
+// settings say dev_mode) runs ~a minute and cannot be avoided at boot. With
+// pvp.ini [probe] SkipIntro=1 (the default) it plays fast instead: a hook on
+// SwfCutscene::update (vtable slot 10, RVA 0x829A00) finds the cutscene by its
+// name (the std::string at +0x140 that the teardown turns into "cutscenes/<name>")
+// and sets its entity's time scale (Entity+0x10, the double every component's dt
+// is multiplied by -- the same field the winner banner freeze uses) to 25. The
+// cutscene then ends by itself and the game moves on exactly as if it had been
+// watched. Other cutscenes are left alone.
+#define RVA_CUTSCENE_UPDATE 0x829A00
+#define OFF_CUTSCENE_NAME   0x140
+#define OFF_COMP_ENTITY     0x18
+static const unsigned char kCutsceneUpdateEntry[10] = { 0x48,0x8B,0xC4, 0x48,0x89,0x58,0x20, 0x55, 0x56, 0x57 };
+typedef void (__fastcall *fn_cutscene_update)(void*);
+static fn_cutscene_update g_orig_cutscene_update;
+static int g_skip_intro = 1;
+
+static void __fastcall hook_cutscene_update(void* cs) {
+    __try {
+        char name[48];
+        if (g_skip_intro && read_std_string((unsigned char*)cs + OFF_CUTSCENE_NAME, name, sizeof name) &&
+            strcmp(name, "game_intro") == 0) {
+            unsigned char* ent = *(unsigned char**)((unsigned char*)cs + OFF_COMP_ENTITY);
+            if (ent && *(double*)(ent + OFF_ENTITY_TIMESCALE) != 25.0) {
+                *(double*)(ent + OFF_ENTITY_TIMESCALE) = 25.0;
+                plog("intro: playing the opening cutscene at 25x");
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    g_orig_cutscene_update(cs);
+}
+
+static void intro_hooks(HMODULE self) {
+    char ini[MAX_PATH];
+    pvp_ini_path(self, ini);
+    g_skip_intro = GetPrivateProfileIntA("probe", "SkipIntro", 1, ini);
+    if (g_skip_intro)
+        hook(RVA_CUTSCENE_UPDATE, kCutsceneUpdateEntry, 10, (void*)hook_cutscene_update,
+             (void**)&g_orig_cutscene_update, "SwfCutscene::update (fast intro)");
+}
+
+// Run 59: Character::Face (RVA 0x10CE50) does not only write the facing -- it
+// queues deferred lambdas (its lambda_7..12) that turn the cat again later. The
+// AI's endturn path calls it through "orient" (FUN_14013C460) inside GetChoice, on
+// the deciding peer only, so mgmp's state fence put the facing back and the lambda
+// turned it again a moment later. While mgmp is inside a human cat's GetChoice
+// (pvp_choice_fence), Face does nothing at all.
+#define RVA_CHAR_FACE 0x10CE50
+static const unsigned char kFaceEntry[15] = { 0x48,0x89,0x5C,0x24,0x20, 0x55, 0x56, 0x57, 0x41,0x54, 0x41,0x55, 0x41,0x56, 0x41 };
+typedef void (__fastcall *fn_face)(void*, unsigned long long, char, char);
+static fn_face g_orig_face;
+static int     g_choice_fence;
+static long    g_face_swallowed;
+
+void pvp_choice_fence(int on) { g_choice_fence += on ? 1 : -1; if (g_choice_fence < 0) g_choice_fence = 0; }
+
+static void __fastcall hook_face(void* ch, unsigned long long dir, char a, char b) {
+    if (g_choice_fence && g_arena_online) {
+        if (g_face_swallowed++ < 3) plog("net: Character::Face inside a GetChoice swallowed (%ld so far)", g_face_swallowed);
+        return;
+    }
+    g_orig_face(ch, dir, a, b);
+}
+
+static void face_hooks(void) {
+    hook(RVA_CHAR_FACE, kFaceEntry, 15, (void*)hook_face, (void**)&g_orig_face, "Character::Face (choice fence)");
+}
+
+// Soak run 2026-10-26, session 12: wp_MoneyBag ("X_is random_0_to_N") scattered a
+// different number of coins on each peer, and the sim streams parted. An ability's
+// X lives at Ability+0x6C4 and FUN_140044450 re-rolls it -- mode 16 (+0x204) draws
+// randint on the SIMULATION stream -- whenever the ability is selected or previewed,
+// i.e. on the aiming peer only. So during an online fight: no re-roll while the
+// game is asking a human cat for a decision or previewing it (pvp_choice_fence,
+// also held across PlayerBrain::update), and one roll right before
+// Ability::trigger instead (pvp_before_trigger, from mgmp's trigger hook) -- the
+// same instant of the simulation on both peers.
+#define RVA_ABILITY_ROLL_X  0x44450
+#define OFF_ABILITY_X_MODE  0x204
+static const unsigned char kRollXEntry[15] = { 0x48,0x89,0x5C,0x24,0x08, 0x48,0x89,0x6C,0x24,0x10, 0x48,0x89,0x74,0x24,0x18 };
+typedef void (__fastcall *fn_roll_x)(void*);
+static fn_roll_x g_orig_roll_x;
+
+static void __fastcall hook_roll_x(void* ability) {
+    if (g_choice_fence && g_arena_online) return;
+    g_orig_roll_x(ability);
+}
+
+void pvp_before_trigger(void* ability) {
+    if (!g_arena_online || !g_arena_active || !g_orig_roll_x || !ability) return;
+    __try {
+        if (*(int*)((unsigned char*)ability + OFF_ABILITY_X_MODE) == 16) g_orig_roll_x(ability);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+static void roll_x_hooks(void) {
+    hook(RVA_ABILITY_ROLL_X, kRollXEntry, 15, (void*)hook_roll_x, (void**)&g_orig_roll_x, "Ability X roll (choice fence)");
 }

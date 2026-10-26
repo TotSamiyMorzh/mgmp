@@ -26,7 +26,8 @@ namespace {
 
 struct Face {
     int state = 0;            // 0 queued, 1 pixels ready, 2 uploaded, -1 failed
-    int kind = 0;             // 0 cat face, 1 ability icon, 2 passive icon
+    int kind = 0;             // 0 cat face, 1 ability icon, 2 passive icon, 3 item icon
+    int frame = 0;            // item icon: 0-based frame of the clip
     std::string id, alt;
     cr::CatLook look;
     int px = 0;
@@ -73,7 +74,7 @@ void worker_body() {
     for (;;) {
         std::string key, id, alt;
         cr::CatLook look;
-        int px, kind;
+        int px, kind, frame = 0;
         {
             std::unique_lock<std::mutex> lk(g.mu);
             g.cv.wait(lk, [] { return !g.queue.empty(); });
@@ -82,10 +83,20 @@ void worker_body() {
             Face& f = g.faces[key];
             look = f.look;
             px = f.px;
-            kind = f.kind; id = f.id; alt = f.alt;
+            kind = f.kind; id = f.id; alt = f.alt; frame = f.frame;
         }
         cr::SwfImage im;
         bool ok = false;
+        if (kind == 3) {   // an item, as it is worn: the clip of its slot at its frame
+            try {
+                const std::string& sym = g.catparts.has(id) ? id : alt;
+                ok = g.catparts.has(sym) && g.catparts.render(sym, frame, px, im);
+            } catch (...) { ok = false; }
+            std::lock_guard<std::mutex> lk(g.mu);
+            Face& f = g.faces[key];
+            if (ok) { f.img = std::move(im); f.state = 1; } else f.state = -1;
+            continue;
+        }
         if (kind) {
             const char* sym = kind == 1 ? "AbilityIcon" : "PassiveIcon";
             try {
@@ -140,6 +151,38 @@ static unsigned upload(Face& f) {
         f.state = 2;
     }
     return f.state == 2 ? f.tex : 0;
+}
+
+unsigned portraits_item(const char* kind, int frame, int px, int* w, int* h) {
+    if (!g.ready || !kind || !kind[0] || frame < 1) return 0;
+    // The slots' clips in swfs/catparts.swf (pvp/tools/make_item_icons.py): the
+    // front layer, or the back one where an item has no front.
+    const char* front = nullptr, *back = nullptr;
+    if (!strcmp(kind, "head"))         { front = "HeadItemF"; back = "HeadItemB"; }
+    else if (!strcmp(kind, "face"))    { front = "FaceItemF"; back = "FaceItemB"; }
+    else if (!strcmp(kind, "neck"))    { front = "NeckItemF"; back = "NeckItemB"; }
+    else if (!strcmp(kind, "weapon"))  { front = back = "Weapon"; }
+    else if (!strcmp(kind, "trinket")) { front = back = "Trinket"; }
+    else return 0;
+    std::string key = std::string("I|") + kind + "|" + std::to_string(frame) + "|" + std::to_string(px);
+    std::lock_guard<std::mutex> lk(g.mu);
+    auto it = g.faces.find(key);
+    if (it == g.faces.end()) {
+        Face f;
+        f.kind = 3;
+        f.id = front;
+        f.alt = back;
+        f.frame = frame - 1;
+        f.px = px;
+        g.faces.emplace(key, std::move(f));
+        g.queue.push_back(key);
+        g.cv.notify_one();
+        return 0;
+    }
+    unsigned tex = upload(it->second);
+    if (tex && w) *w = it->second.img.w;
+    if (tex && h) *h = it->second.img.h;
+    return tex;
 }
 
 unsigned portraits_icon(int passive, const char* id, const char* alt, int px) {

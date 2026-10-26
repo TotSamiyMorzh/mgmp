@@ -23,3 +23,5 @@ unsigned portraits_tex(const portrait_look& look, int px, int* w, int* h);
 // the frame of `AbilityIcon` / `PassiveIcon` labelled with the id (combat_roster's
 // lookup), else the one labelled `alt` (an upgraded ability's base). 0 = not ready or none.
 unsigned portraits_icon(int passive, const char* id, const char* alt, int px);
+// An item as worn on a cat: kind "head".."trinket", 1-based catparts frame. 0 until ready.
+unsigned portraits_item(const char* kind, int frame, int px, int* w, int* h);

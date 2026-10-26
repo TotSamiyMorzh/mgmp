@@ -15,6 +15,7 @@
 #include "mgmp_tuning.h"
 #include "mgmp_log.h"
 #include "mgmp_net.h"
+#include "mgmp_steam.h"
 #include "mgmp_session.h"
 #include "mgmp_lockstep.h"
 #include "mgmp_battleid.h"   // kNoBattle
@@ -391,6 +392,63 @@ void draw_nodes() {
     ImGui::EndChild();
 }
 
+// Steam: the friends running this game, with Join (they are hosting) and Invite
+// (we are hosting). The list is re-read every two seconds, not every frame.
+void draw_steam(bool busy, bool live) {
+    ImGui::SeparatorText("steam");
+    if (!steam_ready()) {
+        ImGui::TextDisabled("Steam networking is not available (Steam not running or not logged on)");
+        return;
+    }
+    ImGui::TextDisabled("you");
+    ImGui::SameLine();
+    ImGui::Text("%s  (%llu)", steam_self_name(), (unsigned long long)steam_self_id());
+
+    static SteamFriend friends[32];
+    static int         nfriends = 0;
+    static ULONGLONG   next = 0;
+    const ULONGLONG now = GetTickCount64();
+    if (now >= next) { nfriends = steam_friends_in_game(friends, 32); next = now + 2000; }
+
+    const bool hosting = net_role() == NetRole::Host && steam_hosting();
+    if (hosting)
+        ImGui::TextColored(level_colour(LogLevel::Good),
+                           "hosting over Steam -- friends can use Join Game, or invite them below");
+    if (!nfriends) ImGui::TextDisabled("no friends are in Mewgenics right now");
+    ImGui::BeginDisabled(busy);
+    for (int i = 0; i < nfriends; ++i) {
+        const SteamFriend& f = friends[i];
+        ImGui::PushID(i);
+        ImGui::Text("%s%s", f.name, f.hosting ? "  [hosting]" : "");
+        if (hosting) {
+            ImGui::SameLine();
+            if (ImGui::SmallButton("invite")) steam_invite(f.id);
+        } else if (f.hosting && !live) {
+            ImGui::SameLine();
+            if (ImGui::SmallButton("join")) {
+                char addr[40];
+                _snprintf_s(addr, sizeof(addr), _TRUNCATE, "steam:%llu", (unsigned long long)f.id);
+                session_request_join(addr, (uint16_t)g.port);
+            }
+        }
+        ImGui::PopID();
+    }
+    ImGui::EndDisabled();
+    if (!live) {
+        static char sid[32] = {};
+        ImGui::SetNextItemWidth(180.0f);
+        ImGui::InputText("host SteamID", sid, sizeof(sid), ImGuiInputTextFlags_CharsDecimal);
+        ImGui::SameLine();
+        ImGui::BeginDisabled(busy || !sid[0]);
+        if (ImGui::Button("join by id")) {
+            char addr[48];
+            _snprintf_s(addr, sizeof(addr), _TRUNCATE, "steam:%s", sid);
+            session_request_join(addr, (uint16_t)g.port);
+        }
+        ImGui::EndDisabled();
+    }
+}
+
 // The connect controls.
 //
 // Every button here only ever RECORDS a request; session_update applies it at
@@ -434,6 +492,8 @@ void draw_connect() {
         ImGui::SameLine();
         ImGui::TextDisabled("applying...");
     }
+
+    draw_steam(busy, live);
 
     // ARM THE LEAVE PATH BY HAND. This exists because the feature has three
     // stages that fail identically from the outside -- the host never announced,

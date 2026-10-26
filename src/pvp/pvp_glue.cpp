@@ -8,7 +8,12 @@
 #include "pvp_glue.h"
 
 #include "MinHook.h"
+#include "mgmp_config.h"
+#include "mgmp_lockstep.h"
 #include "mgmp_log.h"
+#include "mgmp_net.h"
+#include "mgmp_proto.h"
+#include "mgmp_session.h"
 
 extern "C" int MJ_Require(const char*) { return 1; }
 
@@ -31,3 +36,21 @@ extern "C" int MJ_Resolve(MewjectorAPI* api) {
     api->InstallHook = &shim_install;
     return 1;
 }
+
+extern "C" int pvp_net_mode(void) {
+    using namespace mgmp;
+    if (!config().net_pvp || !net_active() || !session_ready()) return 0;
+    return net_role() == NetRole::Host ? 1 : net_role() == NetRole::Client ? 2 : 0;
+}
+
+extern "C" int pvp_net_send(uint8_t sub, const void* data, uint32_t size) {
+    mgmp::PvpMsg m;
+    m.sub = sub;
+    m.size = size;
+    m.data = (uint8_t*)data;
+    return mgmp::net_send_pvp(m) ? 1 : 0;
+}
+
+extern "C" void pvp_lockstep_enter(uint64_t battle_id) { mgmp::lockstep_enter_battle(battle_id); }
+extern "C" void pvp_lockstep_split(int (*owner)(const void*)) { mgmp::lockstep_set_split_owner(owner); }
+extern "C" int  pvp_lockstep_halted(void) { return mgmp::lockstep_halted() ? 1 : 0; }

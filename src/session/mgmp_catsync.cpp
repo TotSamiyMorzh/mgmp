@@ -277,6 +277,7 @@ void catsync_forget() {
 }
 
 void catsync_publish(const char* why) {
+    if (config().net_pvp) return;   // PvP mode: no co-op meta layer
     ensure_state();
     if (!g.on || g.is_client || !net_active()) return;
 
@@ -428,6 +429,7 @@ void catsync_apply_pending(const char* why) {
 }
 
 void catsync_on_message(const CatDataMsg& m) {
+    if (config().net_pvp) return;   // PvP mode: no co-op meta layer
     ensure_state();
     if (!g.on) return;
     if (!g.is_client) {

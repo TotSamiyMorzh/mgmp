@@ -43,6 +43,12 @@ struct Config {
     // and stops its own map clicks being swallowed -- how you drive the two
     // instances to the same battle by hand. (-NoFollow)
     bool     net_follow = true;
+    // net.mode = "pvp": the session is a PvP arena between two players' OWN houses
+    // (src/pvp), not a shared adventure. The co-op meta layer is off: no save
+    // transfer, no save-slot redirection, no map follow, no cat / inventory / run
+    // history pushes, no choice replication, no "host left the run". Battle
+    // lockstep, the combat lock and the aim preview stay.
+    bool     net_pvp = false;
 
     // debug.follow_delay_ms makes the CLIENT sit on the host's node choice for
     // that long before following it, manufacturing the late-join gap on demand.

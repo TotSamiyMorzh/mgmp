@@ -1,0 +1,14 @@
+Mewgenics PvP (mgmp) -- changelog
+
+1.0.0  (2026-10-26)  first release
+- Online PvP arena between two players' own houses: each picks cats from their
+  own save, the fight is deterministic lockstep, and both games check every turn.
+- Connect over Steam (friends list "Join Game", invite, or join by id) -- no
+  ports, no IP. Direct TCP (port 27600) still works as a fallback.
+- Lobby rules: team size, items (none / random / from home), cover, loot,
+  monsters, bird waves, money, rematch and home.
+- Lobby and arena in English or Russian, following the game language.
+- The opponent's mana bars are hidden.
+- The long intro cutscene is skipped (sped up).
+- No game files ship with the mod: everything it needs is read from the
+  player's own game at run time.

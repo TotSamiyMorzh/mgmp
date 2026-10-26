@@ -541,6 +541,7 @@ void choice_on_level_update(void* level_screen) {
 // --- receiving -------------------------------------------------------------
 
 void choice_on_message(const ChoiceMsg& m) {
+    if (config().net_pvp) return;   // PvP mode: no co-op meta layer
     if (!g.on) return;
     Guard guard;
 

@@ -68,6 +68,8 @@ typedef struct {
 typedef void (*lobby_log_fn)(const char* fmt, ...);
 
 void lobby_set_log(lobby_log_fn f);
+// 1 = English UI (the game is not in Russian), 0 = Russian. Call before lobby_open.
+void lobby_set_english(int en);
 // Opens the window with the house's cats (team preassigned) and the defaults.
 void lobby_open(const lobby_cat* cats, int n, const lobby_settings* s);
 // The house storage, for the house preset's picking step. Call before lobby_open.
@@ -78,6 +80,31 @@ void lobby_on_swap(void);
 // Returns 1 once after the players pressed СТАРТ, filling the chosen cats
 // (with their teams) and settings.
 int  lobby_take_start(lobby_cat* cats, int* n, lobby_settings* s);
+
+// --- online (mgmp net.mode = "pvp") ---------------------------------------
+// Opens the lobby for one player of an online fight: `cats` are THIS player's house
+// cats; this player picks for team 1 (host) or team 2 (client). The other team is
+// shown from lobby_set_remote. The client's rules are read-only (the host's win).
+void lobby_open_online(const lobby_cat* cats, int n, const lobby_settings* s, int is_host);
+// The other player's name and picked cats (from their PICK message).
+void lobby_set_remote(const char* name, const lobby_cat* cats, int n);
+// Client: the host's rules (this player's own name is kept).
+void lobby_set_settings(const lobby_settings* s);
+// This player's picks (in pick order), name and current rules. Returns the count.
+int  lobby_get_local(lobby_cat* cats, char* name32, lobby_settings* s);
+// Closes the lobby without starting (the other player cancelled / the fight began).
+void lobby_close(void);
+// 1 once after THIS player closed the lobby without starting (Отмена / ESC).
+int  lobby_take_cancel(void);
+// 1 while the lobby is in online mode.
+int  lobby_is_online(void);
+// Auto mode (pvp.ini [auto]): picks team_max random cats for this player's team,
+// replacing its picks. Returns how many were picked.
+int  lobby_auto_pick(unsigned seed);
+// This player's current pick count (0 when no online lobby is open).
+int  lobby_local_count(void);
+// Auto mode, "Из дома": random kits for this player's cats from this storage.
+void lobby_auto_kits(void);
 
 #ifdef __cplusplus
 }

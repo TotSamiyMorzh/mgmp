@@ -20,6 +20,7 @@
 //   MGMP_NOFOLLOW=1  do not follow a Steam re-launch; report it and stop, which
 //                    is what you want when you are trying to see the relaunch
 //                    itself rather than work around it.
+#include "mgmp_modpath.h"
 #include "mgmp_addresses.h"
 
 #include <windows.h>
@@ -497,6 +498,14 @@ int wmain(int argc, wchar_t** argv) {
         return ok ? 0 : 1;
     }
 
+    // --- make-modpath mode: the PvP data alone, for a test or a by-hand check ---
+    if (argc >= 4 && _wcsicmp(argv[1], L"--make-modpath") == 0) {
+        std::wstring report;
+        bool ok = modpath_generate(argv[2], argv[3], report);
+        wprintf(L"[%c] modpath: %s\n", ok ? L'+' : L'!', report.c_str());
+        return ok ? 0 : 1;
+    }
+
     // --- launch mode ---
     wchar_t game[MAX_PATH] = {};
     int     first_game_arg = 2;
@@ -520,11 +529,25 @@ int wmain(int argc, wchar_t** argv) {
     wcsncpy_s(workdir, game, _TRUNCATE);
     if (wchar_t* slash = wcsrchr(workdir, L'\\')) *slash = 0;
 
+    // -modpaths <dir>: the PvP arena's data is made here from this game's own
+    // files before the game reads it (see mgmp_modpath.cpp).
+    for (int i = first_game_arg; i + 1 < argc; ++i)
+        if (_wcsicmp(argv[i], L"-modpaths") == 0) {
+            wchar_t full[MAX_PATH];
+            if (!GetFullPathNameW(argv[i + 1], MAX_PATH, full, nullptr)) wcsncpy_s(full, argv[i + 1], _TRUNCATE);
+            std::wstring report;
+            bool ok = modpath_generate(game, full, report);
+            wprintf(L"[%c] PvP data in %s: %s\n", ok ? L'+' : L'!', full, report.c_str());
+        }
+
+    // Arguments are re-quoted: a path with a space in it arrives here unquoted.
     wchar_t cmdline[4096];
     swprintf_s(cmdline, L"\"%s\"", game);
     for (int i = first_game_arg; i < argc; ++i) {
-        wcsncat_s(cmdline, L" ", _TRUNCATE);
+        bool quote = wcschr(argv[i], L' ') != nullptr;
+        wcsncat_s(cmdline, quote ? L" \"" : L" ", _TRUNCATE);
         wcsncat_s(cmdline, argv[i], _TRUNCATE);
+        if (quote) wcsncat_s(cmdline, L"\"", _TRUNCATE);
     }
 
     STARTUPINFOW        si = { sizeof(si) };

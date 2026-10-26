@@ -444,6 +444,7 @@ void follow_catchup(uint8_t peer) {
 }
 
 void follow_on_message(const EnterNodeMsg& m) {
+    if (config().net_pvp) return;   // PvP mode: no co-op meta layer
     if (!g.on) return;
     Guard guard;
     if (!g.is_client) {

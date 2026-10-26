@@ -260,6 +260,21 @@ void hooks_implied_by(bool net_configured) {
         g_cfg.hook[T_HighlightRefresh] = tune::kAimPreview;
     }
 
+    // PvP mode: the co-op meta layer's hooks stay out (see Config::net_pvp).
+    if (g_cfg.net_pvp) {
+        g_cfg.hook[T_SFStoreBlob]    = false;
+        g_cfg.hook[T_SFLoadBlob]     = false;
+        g_cfg.hook[T_EventChoice]    = false;
+        g_cfg.hook[T_EventUpdate]    = false;
+        g_cfg.hook[T_LevelSelect]    = false;
+        g_cfg.hook[T_LevelUpdate]    = false;
+        g_cfg.hook[T_SaveSelUpdate]  = false;
+        g_cfg.hook[T_SaveSlotClick]  = false;
+        g_cfg.hook[T_MewDirectorInit]= false;
+        g_cfg.hook[T_MapUpdate]      = false;
+        g_cfg.hook[T_EnterNode]      = false;
+    }
+
     // The panel needs the frame hook one step removed: its connect buttons can
     // start a session in a process launched with role = off, and a socket with
     // nothing pumping it is the same dead handshake as above.
@@ -317,6 +332,11 @@ void config_load(const wchar_t* dll_dir) {
 
     if (const json* net = member(j, "net")) {
         read_str (*net, "role", g_cfg.net_role, sizeof(g_cfg.net_role));
+        {
+            char mode[16] = "coop";
+            read_str(*net, "mode", mode, sizeof(mode));
+            g_cfg.net_pvp = _stricmp(mode, "pvp") == 0;
+        }
         read_str (*net, "addr", g_cfg.net_addr, sizeof(g_cfg.net_addr));
         uint32_t port = g_cfg.net_port;
         read_uint(*net, "port", port, 1, 65535);

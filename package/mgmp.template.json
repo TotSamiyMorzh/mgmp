@@ -1,0 +1,25 @@
+{
+  "game": "@GAME@",
+  "log": "mgmp_@ROLE@.log",
+  "net": {
+    "role": "@ROLE@",
+    "addr": "@ADDR@",
+    "port": 27600,
+    "control": "auto",
+    "mode": "pvp"
+  },
+  "ui": {
+    "enabled": true,
+    "visible": true,
+    "key": "F1"
+  },
+  "debug": {
+    "follow": true,
+    "follow_delay_ms": 0,
+    "join_barrier": true,
+    "desync_halt": true,
+    "record": false,
+    "record_note": "",
+    "replay": ""
+  }
+}

@@ -34,7 +34,14 @@
 #include <cstring>
 #include <cstdarg>
 
+#include "pvp_glue.h"
+
 namespace mgmp {
+
+// Set by the PvP arena (pvp_lockstep_set_split_owner): which peer position owns
+// a human cat. Null outside PvP.
+static int (*g_split_owner)(const void* character) = nullptr;
+void lockstep_set_split_owner(int (*fn)(const void*)) { g_split_owner = fn; }
 namespace {
 
 // This counts ENTRIES IN THE BATTLE'S CHARACTER LIST, which is mostly scenery.
@@ -371,7 +378,7 @@ bool read_affecting_elements(const void* chr, uint32_t out[2]) {
 // 0x00000400 and the client faulted, then on the rerun the two swapped. Which
 // peer "wins" is a coin flip, which is exactly what a state hash must never
 // contain.
-bool read_cat_state(const void* chr, CatState& out, bool in_battle = true) {
+bool read_cat_state(const void* chr, CatState& out, bool in_battle = true, bool with_elements = true) {
     out = CatState{};
     out.in_battle = in_battle ? 1 : 0;
     if (!chr) return false;
@@ -417,7 +424,7 @@ bool read_cat_state(const void* chr, CatState& out, bool in_battle = true) {
     // board and still be in the live character list, which is exactly the
     // battle that exposed this.
     uint32_t el[2] = { 0, 0 };
-    if (in_battle && !off_board(out) && read_affecting_elements(chr, el)) {
+    if (with_elements && in_battle && !off_board(out) && read_affecting_elements(chr, el)) {
         out.e0 = el[0];
         out.e1 = el[1];
         out.elems = 1;
@@ -815,13 +822,28 @@ void snapshot_cats(void* turn_control) {
                                  "this repeats, PEERS never arrived");
         }
         const SplitRange range = split_for(g.humans, P, pos);
-        const uint32_t   mine  = range.count;
+        uint32_t mine = range.count;
 
         uint32_t seen = 0;
         for (uint32_t i = 0; i < g.cat_count; ++i) {
             if (!g.human_cat[i]) continue;
             g.local_cat[i] = split_owns(range, seen);
             ++seen;
+        }
+
+        // PvP arena: the owner is the cat's TEAM, not its roster position (the
+        // game spawns the two teams interleaved). -1 = no opinion.
+        if (g_split_owner) {
+            uint32_t overridden = 0;
+            mine = 0;
+            for (uint32_t i = 0; i < g.cat_count; ++i) {
+                if (!g.human_cat[i]) continue;
+                int owner = g_split_owner(g.cats[i]);
+                if (owner >= 0) { g.local_cat[i] = ((uint32_t)owner == pos); ++overridden; }
+                if (g.local_cat[i]) ++mine;
+            }
+            log_line("LOCKSTEP", "control split by the PvP arena: %u of %u human cat(s) "
+                                 "assigned by team, %u local", overridden, g.humans, mine);
         }
 
         if (mine == 0 && g.humans)
@@ -1987,6 +2009,7 @@ struct StateFence {
     bool     armed = false;
     uint32_t hits  = 0;     // cats that moved, ever, this session
     bool     said  = false;
+    uint32_t vitals = 0;    // cats whose HP/shield/max HP were put back (restore_vitals)
 };
 
 StateFence g_sf;
@@ -1996,11 +2019,15 @@ void lockstep_state_fence_begin() {
     if (!g.active || !g.snapped || g.halted) return;
     g_sf.count = g.cat_count > kMaxCats ? kMaxCats : g.cat_count;
     for (uint32_t i = 0; i < g_sf.count; ++i)
-        g_sf.got[i] = read_cat_state(g.cats[i], g_sf.snap[i]);
+        // Without the element call: the fence runs on every GetChoice poll, and
+        // get_affecting_elements is a call INTO the game that faulted 1521 times
+        // in one soak session (a fault abandons the callee half-way; that session
+        // then crashed). Facing, HP and the tile are plain reads.
+        g_sf.got[i] = read_cat_state(g.cats[i], g_sf.snap[i], true, false);
     g_sf.armed = true;
 }
 
-uint32_t lockstep_state_fence_end(const char* what) {
+uint32_t lockstep_state_fence_end(const char* what, bool restore_vitals) {
     if (!g_sf.armed) return 0;
     g_sf.armed = false;
 
@@ -2008,7 +2035,7 @@ uint32_t lockstep_state_fence_end(const char* what) {
     for (uint32_t i = 0; i < g_sf.count; ++i) {
         if (!g_sf.got[i]) continue;
         CatState now{};
-        if (!read_cat_state(g.cats[i], now)) continue;
+        if (!read_cat_state(g.cats[i], now, true, false)) continue;
 
         const CatState& was = g_sf.snap[i];
         const bool face_moved = (now.fx != was.fx || now.fy != was.fy);
@@ -2023,6 +2050,20 @@ uint32_t lockstep_state_fence_end(const char* what) {
         if (!face_moved && !rest_moved) continue;
         ++moved;
 
+        // GetChoice for a human cat must not change anything, and the soak run of
+        // 2026-10-26 caught the AI's evaluation (the auto decision, or a
+        // mind-control status deciding inside a PlayerBrain) dealing REAL damage
+        // -- 8 HP to every cover object around, on the deciding peer only. For
+        // that caller HP, shield and max HP go back too, unless the cat died
+        // (a death has consequences that cannot be written back).
+        if (restore_vitals && now.dead == was.dead &&
+            (now.hp != was.hp || now.shield != was.shield || now.maxhp != was.maxhp)) {
+            mem_write((uint8_t*)g.cats[i] + kChar_HP,     &was.hp,     sizeof(was.hp));
+            mem_write((uint8_t*)g.cats[i] + kChar_Shield, &was.shield, sizeof(was.shield));
+            mem_write((uint8_t*)g.cats[i] + kChar_MaxHP,  &was.maxhp,  sizeof(was.maxhp));
+            ++g_sf.vitals;
+        }
+
         if (face_moved) {
             // Putting it back is correct here for the same reason it is correct
             // in the aim-preview freeze: the only facing either peer may read
@@ -2036,12 +2077,13 @@ uint32_t lockstep_state_fence_end(const char* what) {
             log_line_lvl(rest_moved ? LogLevel::Error : LogLevel::Warn, "LOCKSTEP",
                          "!! %s moved cat %u's state: face (%d,%d)->(%d,%d)%s "
                          "hp %d->%d tile (%d,%d)->(%d,%d) dead %u->%u. Facing is "
-                         "put back; the rest is NOT, because a value invented "
+                         "put back%s; the rest is NOT, because a value invented "
                          "here would hide a divergence rather than fix one.",
                      what, i, was.fx, was.fy, now.fx, now.fy,
                      face_moved ? " (restored)" : "",
                      was.hp, now.hp, was.tx, was.ty, now.tx, now.ty,
-                     (unsigned)was.dead, (unsigned)now.dead);
+                     (unsigned)was.dead, (unsigned)now.dead,
+                     restore_vitals ? ", and so are HP/shield/max HP" : "");
         }
     }
     g_sf.hits += moved;
@@ -2125,6 +2167,12 @@ void lockstep_pump() {
             // outside the battle it was taken in.
             case MSG_CATDATA:
                 catsync_on_message(m.catdata);
+                break;
+
+            // The PvP arena's own messages (src/pvp): lobby, picks, the fight's
+            // inputs, rematch / home. Not battle-gated; the arena orders them.
+            case MSG_PVP:
+                pvp_on_message(m.from, m.pvp.sub, m.pvp.data, m.pvp.size);
                 break;
 
             // Run state as well, and not epoch-gated for the same reason.
@@ -2642,6 +2690,23 @@ void lockstep_turn_boundary(void* turn_control) {
 
 uint64_t lockstep_battle_id()  { return g.active ? g.battles.current : kNoBattle; }
 bool     lockstep_local_actor(){ return g.active && g.snapped && g.local_actor; }
+
+bool lockstep_human_brain(const void* brain) {
+    if (!g.active || !g.snapped || !brain) return false;
+    const void* actor = nullptr;
+    if (!mem_read((const uint8_t*)brain + kBrain_Owner, &actor, sizeof(actor)) || !actor)
+        return false;
+    const uint8_t cat = cat_index_of(actor);
+    return cat != kNoCat && g.human_cat[cat];
+}
+
+bool lockstep_local_human_brain(const void* brain) {
+    if (!lockstep_human_brain(brain)) return false;
+    const void* actor = nullptr;
+    if (!mem_read((const uint8_t*)brain + kBrain_Owner, &actor, sizeof(actor)) || !actor)
+        return false;
+    return g.local_cat[cat_index_of(actor)];
+}
 
 bool lockstep_peer_owns_character(const void* character) {
     if (!g.active || !g.snapped || !character) return false;

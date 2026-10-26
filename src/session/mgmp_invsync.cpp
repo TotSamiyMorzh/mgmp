@@ -433,6 +433,7 @@ void invsync_forget() {
 }
 
 void invsync_publish(const char* why) {
+    if (config().net_pvp) return;   // PvP mode: no co-op meta layer
     ensure_state();
     if (!g.on || g.is_client || !net_active()) return;
 
@@ -590,6 +591,7 @@ static void apply_now(const InventoryMsg& m, const char* when) {
 static bool defer_applies() { return g.is_client && config().net_follow; }
 
 void invsync_on_message(const InventoryMsg& m) {
+    if (config().net_pvp) return;   // PvP mode: no co-op meta layer
     ensure_state();
     if (!g.on) return;
     if (!g.is_client) {

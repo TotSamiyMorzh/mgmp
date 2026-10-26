@@ -336,6 +336,7 @@ void leave_set_base(uintptr_t /*base*/) {
 bool leave_in_run() { return g.where == Where::InRun; }
 
 void leave_pump() {
+    if (config().net_pvp) return;   // PvP mode: no co-op meta layer
     ensure_state();
 
     // THE COOLDOWN IS SERVICED BEFORE EVERY EARLY RETURN, and that ordering is
@@ -441,6 +442,7 @@ void leave_pump() {
 }
 
 void leave_on_message(const HostLeftMsg& m) {
+    if (config().net_pvp) return;   // PvP mode: no co-op meta layer
     ensure_state();
     if (!g.on) return;
     ++g.received;
@@ -537,6 +539,7 @@ void leave_request_local() {
 }
 
 void leave_on_button_update(void* button) {
+    if (config().net_pvp) return;   // PvP mode: no co-op meta layer
     // The cheap tests first, in this order deliberately: this runs for every
     // button in the game on every frame, and g.pending is false for the whole
     // of a normal session.

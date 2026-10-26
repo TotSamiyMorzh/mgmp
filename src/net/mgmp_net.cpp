@@ -2,6 +2,7 @@
 
 #include "mgmp_net.h"
 #include "mgmp_log.h"
+#include "mgmp_steam.h"
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -32,11 +33,15 @@ static_assert(kMaxFrame <= kMaxPayload, "frame cap must fit the protocol cap");
 // and a thread per link keeps the per-link byte stream strictly ordered with no
 // interleaving logic to get wrong -- which matters because the relay runs on
 // this thread.
+// A link is either a TCP socket (with its own receive thread) or a Steam peer
+// (steam != 0): no socket and no thread -- its messages are drained on the game
+// thread by net_poll, through steam_poll.
 struct Link {
     SOCKET        sock   = INVALID_SOCKET;
     HANDLE        thread = nullptr;
     uint8_t       id     = kNoPeer;
     volatile LONG live   = 0;
+    uint64_t      steam  = 0;
 };
 
 struct State {
@@ -167,6 +172,7 @@ bool decode_into(const uint8_t* buf, uint32_t len, NetMsg& m) {
         case MSG_STATEDUMP: return dec_statedump(r, m.statedump);
         case MSG_NODEHASH:  return dec_nodehash(r, m.nodehash);
         case MSG_HOSTLEFT:  return dec_hostleft(r, m.hostleft);
+        case MSG_PVP:       return dec_pvp(r, m.pvp);
         case MSG_PEERS:   return dec_peers(r, m.peers);
         case MSG_HALT:    return dec_halt(r, m.halt);
         case MSG_REFUSE:  r.str(m.refuse, sizeof(m.refuse)); return r.ok;
@@ -196,6 +202,25 @@ bool send_framed(SOCKET s, uint8_t from, const uint8_t* payload, uint32_t len) {
     }
     if (ok) { ++g.stats.sent; g.stats.bytes_sent += n + 4; }
     LeaveCriticalSection(&g.send_cs);
+    return ok;
+}
+
+// One framed message on one link, whichever kind it is. A Steam message keeps
+// its own boundaries, so it carries only the envelope and the payload.
+bool send_link(Link& l, uint8_t from, const uint8_t* payload, uint32_t len) {
+    if (!l.steam) return send_framed(l.sock, from, payload, len);
+    if (len == 0) return false;
+    uint8_t  stackbuf[1024];
+    uint8_t* buf = len + kEnvelopeBytes <= sizeof(stackbuf) ? stackbuf
+                 : (uint8_t*)malloc(len + kEnvelopeBytes);
+    if (!buf) return false;
+    buf[0] = from;
+    memcpy(buf + kEnvelopeBytes, payload, len);
+    EnterCriticalSection(&g.send_cs);
+    bool ok = steam_send(l.steam, buf, len + kEnvelopeBytes);
+    if (ok) { ++g.stats.sent; g.stats.bytes_sent += len + kEnvelopeBytes; }
+    LeaveCriticalSection(&g.send_cs);
+    if (buf != stackbuf) free(buf);
     return ok;
 }
 
@@ -230,7 +255,7 @@ void host_relay(uint8_t from, const uint8_t* payload, uint32_t len) {
         Link& l = g.links[i];
         if (!InterlockedCompareExchange(&l.live, 0, 0)) continue;
         if (l.id == from) continue;              // not back to its author
-        send_framed(l.sock, from, payload, len);
+        send_link(l, from, payload, len);
     }
 }
 
@@ -266,7 +291,7 @@ void host_publish_roster() {
         mine.you = l.id;
         uint8_t p[64];
         uint32_t n = enc_peers(p, sizeof(p), mine);
-        if (n) send_framed(l.sock, kHostPeer, p, n);
+        if (n) send_link(l, kHostPeer, p, n);
     }
 
     NetMsg self{};
@@ -277,7 +302,56 @@ void host_publish_roster() {
     queue_push(self);
 }
 
-// The receive loop for ONE link. Owns that link's socket for its lifetime.
+// One received frame (envelope + payload) from one link: relay it, decode it,
+// queue it. False when the frame is bad and the link should be closed.
+bool handle_frame(Link& link, const uint8_t* buf, uint32_t len) {
+    uint8_t         from    = buf[0];
+    const uint8_t*  payload = buf + kEnvelopeBytes;
+    uint32_t        plen    = len - kEnvelopeBytes;
+    if (plen == 0) return true;                  // envelope with no message
+
+    // A client may only speak for itself. Believing a forged `from` would
+    // let one peer inject another's decisions, so the host overwrites it
+    // with the id it handed that link rather than trusting what arrived.
+    if (g.role == NetRole::Host) from = link.id;
+
+    // Relay BEFORE decoding and queuing. Decoding can allocate and the game
+    // thread may be mid-frame; the other clients should not wait on either.
+    if (g.role == NetRole::Host && relayed(payload[0]))
+        host_relay(from, payload, plen);
+
+    NetMsg m{};
+    if (!decode_into(payload, plen, m)) {
+        log_line("NET", "!! undecodable %s frame from peer %u, %u bytes -- closing",
+                 msg_name(payload[0]), (unsigned)from, plen);
+        return false;
+    }
+    m.from = from;
+    g.stats.bytes_received += len + 4;
+    queue_push(m);
+    return true;
+}
+
+// A link went away (its socket closed, or its Steam session ended).
+void link_down(Link& link) {
+    InterlockedExchange(&link.live, 0);
+    if (link.sock != INVALID_SOCKET) { closesocket(link.sock); link.sock = INVALID_SOCKET; }
+    if (link.steam) { steam_close(link.steam); link.steam = 0; }
+
+    if (!InterlockedCompareExchange(&g.stop, 0, 0)) {
+        log_line("NET", "peer %u disconnected", (unsigned)link.id);
+        if (g.role == NetRole::Host) {
+            // One client leaving is not the end of the session for the others.
+            // Whether the RUN can continue is the session layer's call; the
+            // transport only reports the membership change.
+            host_publish_roster();
+        } else {
+            set_state(NetState::Closed);
+        }
+    }
+}
+
+// The receive loop for ONE TCP link. Owns that link's socket for its lifetime.
 void recv_loop(Link& link) {
     // Sized for MSG_SAVEFILE, which is the only frame that is not a few hundred
     // bytes. Heap rather than stack: a receive thread's stack is not the place
@@ -297,49 +371,11 @@ void recv_loop(Link& link) {
             break;
         }
         if (!recv_exact(link.sock, buf, len)) break;
-
-        uint8_t         from    = buf[0];
-        const uint8_t*  payload = buf + kEnvelopeBytes;
-        uint32_t        plen    = len - kEnvelopeBytes;
-        if (plen == 0) continue;                 // envelope with no message
-
-        // A client may only speak for itself. Believing a forged `from` would
-        // let one peer inject another's decisions, so the host overwrites it
-        // with the id it handed that socket rather than trusting what arrived.
-        if (g.role == NetRole::Host) from = link.id;
-
-        // Relay BEFORE decoding and queuing. Decoding can allocate and the game
-        // thread may be mid-frame; the other clients should not wait on either.
-        if (g.role == NetRole::Host && relayed(payload[0]))
-            host_relay(from, payload, plen);
-
-        NetMsg m{};
-        if (!decode_into(payload, plen, m)) {
-            log_line("NET", "!! undecodable %s frame from peer %u, %u bytes -- closing",
-                     msg_name(payload[0]), (unsigned)from, plen);
-            break;
-        }
-        m.from = from;
-        g.stats.bytes_received += len + 4;
-        queue_push(m);
+        if (!handle_frame(link, buf, len)) break;
     }
 
     free(buf);
-
-    InterlockedExchange(&link.live, 0);
-    if (link.sock != INVALID_SOCKET) { closesocket(link.sock); link.sock = INVALID_SOCKET; }
-
-    if (!InterlockedCompareExchange(&g.stop, 0, 0)) {
-        log_line("NET", "peer %u disconnected", (unsigned)link.id);
-        if (g.role == NetRole::Host) {
-            // One client leaving is not the end of the session for the others.
-            // Whether the RUN can continue is the session layer's call; the
-            // transport only reports the membership change.
-            host_publish_roster();
-        } else {
-            set_state(NetState::Closed);
-        }
-    }
+    link_down(link);
 }
 
 DWORD WINAPI link_thread(LPVOID param) {
@@ -420,6 +456,71 @@ DWORD WINAPI accept_thread(LPVOID) {
     return 0;
 }
 
+// --- Steam links -------------------------------------------------------------
+// Drained on the game thread from net_poll. A message from a SteamID nobody has
+// a link for is, on the host, a new client arriving (the Steam twin of accept());
+// on a client it is ignored -- only the host may talk to a client.
+
+int steam_slot_of(uint64_t id) {
+    for (int i = 0; i < kMaxPeers; ++i)
+        if (InterlockedCompareExchange(&g.links[i].live, 0, 0) && g.links[i].steam == id)
+            return i;
+    return -1;
+}
+
+void steam_on_message(uint64_t peer, const uint8_t* data, uint32_t len, void*) {
+    if (g.role == NetRole::None || len < kEnvelopeBytes) return;
+    int slot = steam_slot_of(peer);
+    if (slot < 0) {
+        if (g.role != NetRole::Host) return;
+        uint8_t id = kNoPeer;
+        for (uint8_t cand = kHostPeer + 1; cand < kMaxPeers; ++cand)
+            if (link_slot_of(cand) < 0) { id = cand; break; }
+        slot = free_link_slot();
+        if (slot < 0 || id == kNoPeer) {
+            log_line("NET", "!! refused Steam player %llu -- the session is full",
+                     (unsigned long long)peer);
+            return;
+        }
+        Link& l = g.links[slot];
+        l.sock  = INVALID_SOCKET;
+        l.thread = nullptr;
+        l.steam = peer;
+        l.id    = id;
+        InterlockedExchange(&l.live, 1);
+        log_line("NET", "peer %u connected over Steam (%llu)", (unsigned)id,
+                 (unsigned long long)peer);
+        set_state(NetState::Connected);
+        host_publish_roster();
+    }
+    Link& l = g.links[slot];
+    if (!handle_frame(l, data, len)) link_down(l);
+}
+
+void steam_pump() {
+    bool any = false;
+    for (int i = 0; i < kMaxPeers; ++i)
+        if (InterlockedCompareExchange(&g.links[i].live, 0, 0) && g.links[i].steam) any = true;
+    if (!any && !(g.role == NetRole::Host && steam_hosting())) return;
+    steam_poll(&steam_on_message, nullptr);
+
+    // Sessions have no socket to close on us, so ask about them -- once a second.
+    static ULONGLONG next = 0;
+    const ULONGLONG now = GetTickCount64();
+    if (now < next) return;
+    next = now + 1000;
+    for (int i = 0; i < kMaxPeers; ++i) {
+        Link& l = g.links[i];
+        if (!InterlockedCompareExchange(&l.live, 0, 0) || !l.steam) continue;
+        if (steam_session_closed(l.steam)) {
+            log_line("NET", "Steam session with peer %u ended", (unsigned)l.id);
+            if (g.role == NetRole::Client)
+                _snprintf_s(g.error, sizeof(g.error), _TRUNCATE, "the Steam session with the host ended");
+            link_down(l);
+        }
+    }
+}
+
 void ensure_cs() {
     if (!g.cs_ready)      { InitializeCriticalSection(&g.cs);      g.cs_ready = true; }
     if (!g.send_cs_ready) { InitializeCriticalSection(&g.send_cs); g.send_cs_ready = true; }
@@ -458,6 +559,9 @@ bool net_host(uint16_t port) {
     g.role = NetRole::Host;
     g.self = kHostPeer;
     log_line("NET", "hosting on port %u", (unsigned)port);
+    // And over Steam at the same time, when Steam is there: friends join by
+    // SteamID through Steam's NAT traversal and relays, no port to forward.
+    if (steam_ready()) steam_set_hosting(true);
 
     InterlockedExchange(&g.stop, 0);
     g.accept_thread = CreateThread(nullptr, 0, accept_thread, nullptr, 0, nullptr);
@@ -468,6 +572,31 @@ bool net_host(uint16_t port) {
 bool net_join(const char* addr, uint16_t port) {
     if (g.role != NetRole::None) return false;
     ensure_cs();
+
+    if (const uint64_t host = steam_parse_addr(addr)) {
+        if (!steam_ready()) {
+            _snprintf_s(g.error, sizeof(g.error), _TRUNCATE, "Steam is not available");
+            set_state(NetState::Failed);
+            log_line("NET", "!! %s", g.error);
+            return false;
+        }
+        g.role = NetRole::Client;
+        g.self = kNoPeer;
+        InterlockedExchange(&g.stop, 0);
+        Link& l = g.links[0];
+        l.sock = INVALID_SOCKET;
+        l.thread = nullptr;
+        l.steam = host;
+        l.id = kHostPeer;
+        InterlockedExchange(&l.live, 1);
+        // A Steam session has no connect step: it opens with the first message
+        // (our HELLO), and a host that never answers shows up as the session
+        // failing, which steam_pump turns into Closed.
+        set_state(NetState::Connected);
+        log_line("NET", "joining %llu over Steam", (unsigned long long)host);
+        return true;
+    }
+
     if (!wsa_init()) return false;
 
     SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -540,7 +669,9 @@ void net_shutdown() {
     for (int i = 0; i < kMaxPeers; ++i) {
         Link& l = g.links[i];
         if (l.sock != INVALID_SOCKET) { shutdown(l.sock, SD_BOTH); closesocket(l.sock); l.sock = INVALID_SOCKET; }
+        if (l.steam) { steam_close(l.steam); l.steam = 0; InterlockedExchange(&l.live, 0); }
     }
+    if (steam_hosting()) steam_set_hosting(false);
 
     if (g.accept_thread) {
         if (WaitForSingleObject(g.accept_thread, 2000) == WAIT_TIMEOUT)
@@ -611,7 +742,7 @@ bool net_send(const uint8_t* payload, uint32_t len) {
     for (int i = 0; i < kMaxPeers; ++i) {
         Link& l = g.links[i];
         if (!InterlockedCompareExchange(&l.live, 0, 0)) continue;
-        if (send_framed(l.sock, g.self, payload, len)) any = true;
+        if (send_link(l, g.self, payload, len)) any = true;
         else failed = true;
     }
     if (failed) log_line("NET", "!! send failed (WSA %d)", WSAGetLastError());
@@ -621,7 +752,7 @@ bool net_send(const uint8_t* payload, uint32_t len) {
 bool net_send_peer(uint8_t peer, const uint8_t* payload, uint32_t len) {
     int slot = link_slot_of(peer);
     if (slot < 0) return false;
-    return send_framed(g.links[slot].sock, g.self, payload, len);
+    return send_link(g.links[slot], g.self, payload, len);
 }
 
 // Every encoder writes into a stack buffer and hands the result to net_send.
@@ -715,6 +846,21 @@ bool net_send_savefile_to(uint8_t peer, const SaveFileMsg& m) {
     return send_savefile_frame(m, false, peer);
 }
 
+bool net_send_pvp(const PvpMsg& m) {
+    uint32_t need = pvp_frame_size(m);
+    if (need > kMaxFrame) {
+        log_line("NET", "!! PvP message %u is %u bytes, over the %u-byte frame cap",
+                 (unsigned)m.sub, m.size, kMaxFrame);
+        return false;
+    }
+    uint8_t* p = (uint8_t*)malloc(need);
+    if (!p) return false;
+    uint32_t n = enc_pvp(p, need, m);
+    bool ok = n && net_send(p, n);
+    free(p);
+    return ok;
+}
+
 bool net_send_catdata(const CatDataMsg& m) {
     uint32_t need = catdata_frame_size(m);
     if (need > kMaxFrame) {
@@ -780,12 +926,14 @@ void net_msg_release(NetMsg& m) {
     if (m.catdata.data)  { free(m.catdata.data);  m.catdata.data  = nullptr; }
     if (m.runhist.data)  { free(m.runhist.data);  m.runhist.data  = nullptr; }
     if (m.statedump.data){ free(m.statedump.data);m.statedump.data= nullptr; }
+    if (m.pvp.data)      { free(m.pvp.data);      m.pvp.data      = nullptr; }
     for (uint32_t i = 0; i < kInvBuckets; ++i)
         if (m.inventory.data[i]) { free(m.inventory.data[i]); m.inventory.data[i] = nullptr; }
 }
 
 bool net_poll(NetMsg& out) {
     if (!g.cs_ready) return false;
+    if (g.role != NetRole::None) steam_pump();
     EnterCriticalSection(&g.cs);
     bool got = g.count > 0;
     if (got) {
@@ -797,6 +945,7 @@ bool net_poll(NetMsg& out) {
         g.queue[g.head].catdata.data  = nullptr;
         g.queue[g.head].runhist.data  = nullptr;
         g.queue[g.head].statedump.data = nullptr;
+        g.queue[g.head].pvp.data       = nullptr;
         for (uint32_t i = 0; i < kInvBuckets; ++i)
             g.queue[g.head].inventory.data[i] = nullptr;
         g.head = (g.head + 1) % kQueueCap;

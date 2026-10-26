@@ -51,6 +51,7 @@ add_library(mgmp SHARED
     src/determinism/mgmp_rng.cpp
     src/determinism/mgmp_replay.cpp
     src/net/mgmp_net.cpp
+    src/net/mgmp_steam.cpp
     src/session/mgmp_lockstep.cpp
     src/session/mgmp_session.cpp
     src/session/mgmp_follow.cpp
@@ -91,13 +92,14 @@ add_library(mgmp SHARED
     src/pvp/pvp_arena.c
     src/pvp/lobby.cpp
     src/pvp/portraits.cpp
+    src/pvp/gamedata.cpp
     src/pvp/portrait/swf.cpp
     src/pvp/portrait/gpak.cpp
     src/pvp/portrait/catportrait.cpp
 )
 # The arena sources carry Russian UI text as UTF-8 literals.
 set_source_files_properties(
-    src/pvp/pvp_arena.c src/pvp/lobby.cpp src/pvp/portraits.cpp src/pvp/pvp_glue.cpp
+    src/pvp/pvp_arena.c src/pvp/lobby.cpp src/pvp/portraits.cpp src/pvp/pvp_glue.cpp src/pvp/gamedata.cpp
     PROPERTIES COMPILE_OPTIONS "/utf-8")
 set_target_properties(mgmp PROPERTIES OUTPUT_NAME "mgmp" PREFIX "")
 target_compile_definitions(mgmp PRIVATE
@@ -118,7 +120,7 @@ target_include_directories(mgmp PRIVATE
 )
 target_link_libraries(mgmp PRIVATE minhook kernel32 user32 shell32 opengl32)
 
-add_executable(mgmp_loader loader/mgmp_loader.cpp res/mgmp_loader.rc)
+add_executable(mgmp_loader loader/mgmp_loader.cpp loader/mgmp_modpath.cpp src/pvp/portrait/gpak.cpp res/mgmp_loader.rc)
 target_compile_definitions(mgmp_loader PRIVATE _CRT_SECURE_NO_WARNINGS)
 target_compile_options(mgmp_loader PRIVATE /W3)
 # third_party for json.hpp: the loader parses mgmp.json for the game path,

@@ -502,7 +502,13 @@ void aim_init() {
     const Config& c = config();
     const bool netted = _stricmp(c.net_role, "host") == 0 ||
                         _stricmp(c.net_role, "client") == 0;
-    g.on = tune::kAimPreview && netted && g.resolved;
+    // Not in PvP: drawing the peer's Move preview moves THEIR cat here and back
+    // (TacticsObject::Move x2 per frame), and in a PvP arena that runs over loot,
+    // water and freshly changed tiles. A host that mirrored the client's aims after
+    // a RainStaff (ChangeTile -> WaterTile) faulted 894 times reading a tile's
+    // objects and then crashed on a freed one (2026-10-22). Opponents need not see
+    // each other's aim anyway.
+    g.on = tune::kAimPreview && netted && g.resolved && !c.net_pvp;
     if (!g.on || g.announced) return;
     g.announced = true;
     log_line_lvl(LogLevel::Trace, "AIM",

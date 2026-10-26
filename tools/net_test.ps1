@@ -82,6 +82,14 @@ param(
     # CMake build tree and config -Build drives, e.g. build\Release\mgmp.dll on
     # the default (multi-config, Visual Studio) generator.
     [string]$BuildDir   = 'build',
+    # PvP arena (src/pvp): both peers get net.mode = "pvp" and the arena's pvp.ini
+    # beside the DLL, and the game is launched with -modpaths <ModPaths>, where the
+    # loader writes the arena level and the PvP data from the game's own files
+    # (default: build_pvpdata\ next to this repository's build trees).
+    [switch]$Pvp,
+    # With -Pvp: unattended fights (pvp.ini [auto] Enabled=1) -- tools/pvp_soak.ps1.
+    [switch]$Auto,
+    [string]$ModPaths   = '',
     [string]$Config     = 'Release'
 )
 
@@ -274,6 +282,17 @@ foreach ($peer in 'host', 'client') {
     # silently never advance.
     $cfg.debug.replay          = ''
 
+    if ($Pvp) {
+        $cfg.net | Add-Member -NotePropertyName mode -NotePropertyValue 'pvp' -Force
+        foreach ($f in 'pvp.ini') {
+            $src = Join-Path $outDir $f
+            if (Test-Path $src) { Copy-Item $src $dir -Force }
+        }
+        if ($Auto) {
+            Add-Content -Path (Join-Path $dir 'pvp.ini') -Value "`r`n[auto]`r`nEnabled=1`r`n" -Encoding ASCII
+        }
+    }
+
     # Save sharing is not optional and has no knob any more -- it is how the
     # client acquires the run. It used to be gated by a switch that defaulted
     # OFF, which meant a plain -Build run could never reach a shared battle and
@@ -301,14 +320,23 @@ if ($LateClient -and -not $NoBarrier) {
     Write-Host "    its rng_hash equal to its own previous turn (the stream never ran)." -ForegroundColor DarkGray
 }
 
+# PvP: the loader takes the game path first and passes the rest to the game.
+$loaderArgs = @()
+if ($Pvp -and -not $ModPaths) { $ModPaths = Join-Path $root 'build_pvpdata' }
+if ($Pvp) {
+    $loaderArgs = @((($baseConfig | ConvertFrom-Json).game), '-modpaths', $ModPaths)
+}
+
 Write-Host "==> launching host (listening on $Port)" -ForegroundColor Cyan
 $hd = Join-Path $root $peers['host']
-Start-Process -FilePath (Join-Path $hd 'mgmp_loader.exe') -WorkingDirectory $hd
+if ($loaderArgs.Count) { Start-Process -FilePath (Join-Path $hd 'mgmp_loader.exe') -WorkingDirectory $hd -ArgumentList $loaderArgs }
+else                   { Start-Process -FilePath (Join-Path $hd 'mgmp_loader.exe') -WorkingDirectory $hd }
 Start-Sleep -Seconds $HostLead
 
 Write-Host "==> launching client (dialling ${Addr}:${Port})" -ForegroundColor Cyan
 $cd = Join-Path $root $peers['client']
-Start-Process -FilePath (Join-Path $cd 'mgmp_loader.exe') -WorkingDirectory $cd
+if ($loaderArgs.Count) { Start-Process -FilePath (Join-Path $cd 'mgmp_loader.exe') -WorkingDirectory $cd -ArgumentList $loaderArgs }
+else                   { Start-Process -FilePath (Join-Path $cd 'mgmp_loader.exe') -WorkingDirectory $cd }
 Start-Sleep -Seconds 10
 
 Write-Host ''

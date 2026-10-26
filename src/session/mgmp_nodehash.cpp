@@ -317,6 +317,7 @@ void nodehash_shutdown() {
 }
 
 void nodehash_on_node(uint64_t node_seed, uint32_t node_index) {
+    if (config().net_pvp) return;   // PvP mode: no co-op meta layer
     if (!g.on || !net_active() || !node_seed) return;
     Guard guard;
 
@@ -388,6 +389,7 @@ void nodehash_on_event_screen(void* world_event) {
 }
 
 void nodehash_on_message(uint8_t from, const NodeHashMsg& m) {
+    if (config().net_pvp) return;   // PvP mode: no co-op meta layer
     if (!g.on) return;
     Guard guard;
     match(from, m);

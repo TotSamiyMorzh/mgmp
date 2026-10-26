@@ -4,6 +4,7 @@
 #include "mgmp_overlay.h"
 #include "mgmp_session.h"
 #include "mgmp_net.h"
+#include "mgmp_steam.h"
 #include "mgmp_catsync.h"
 #include "mgmp_invsync.h"
 #include "mgmp_aim.h"
@@ -472,6 +473,19 @@ void session_shutdown() {
 }
 
 void session_update() {
+    // Steam: register the callbacks early (a "Join Game" can arrive any time),
+    // and turn a join the player asked for through Steam into an ordinary join
+    // request -- "steam:<host id>" is an address net_join understands.
+    if (steam_ready()) {
+        uint64_t host = 0;
+        if (steam_take_join(&host)) {
+            char addr[40];
+            _snprintf_s(addr, sizeof(addr), _TRUNCATE, "steam:%llu", (unsigned long long)host);
+            log_line("SESSION", "joining %s, asked for through Steam", addr);
+            session_request_join(addr, config().net_port);
+        }
+    }
+
     // BEFORE the early return below, deliberately: a Host or Join pressed with
     // no session at all arrives with phase == Off, which is precisely the state
     // that return exists to skip.

@@ -14,6 +14,26 @@ Thanks [Claude](https://claude.ai/). The human didn't write even a single line o
 
 ---
 
+## PvP arena
+
+The same lockstep core also runs a **PvP mode** (`src/pvp`, `net.mode = "pvp"`):
+two players fight each other with the cats from their **own** saves, connected
+over Steam (friends list "Join Game" or an invite, with no port forwarding) or
+direct TCP. The host sets the rules in a lobby: team size, items (none, random
+or from home), cover, loot, monsters and bird waves. Everything both peers do
+is checked every turn, just as in co-op.
+
+The player package is `package/` plus `mgmp.dll` and `mgmp_loader.exe`:
+`tools/make_release.ps1 -Version x.y.z` builds the zip, and
+[`package/README.txt`](package/README.txt) is the player guide (English and
+Russian). No game files ship with it. The loader builds the arena level and
+the bird data in the `-modpaths` folder from the player's own
+`resources.gpak` (`loader/mgmp_modpath.cpp`). The lobby reads names,
+descriptions and item icons from the same archive at run time
+(`src/pvp/gamedata.cpp`, `src/pvp/portraits.cpp`).
+
+---
+
 ## Status
 
 **It works, and it has been played over the internet for a full run.**
@@ -275,7 +295,9 @@ src/determinism/   random number tracking, recording and replay
 src/net/           the network transport and the message format
 src/session/       everything that actually keeps two games in step
 src/ui/            the debug panel and the on-screen overlay
-loader/            mgmp_loader.exe
+src/pvp/           the PvP arena: lobby, arena rules, game-data reader
+loader/            mgmp_loader.exe (and the PvP -modpaths data generator)
+package/           the PvP player package: bats, README, pvp.ini
 tests/             unit tests for the logic that can be tested alone
 tools/             Python and PowerShell helpers used while developing
 third_party/       Dear ImGui, MinHook, stb_image, nlohmann/json

@@ -199,8 +199,95 @@ void __fastcall h_NextTurn(void* self) {
     log_line("NEXTTURN", "<<< turn %u dispatched", t);
 }
 
+// PvP soak testing (pvp.ini [auto]): the game's AI decides for a cat of THIS peer,
+// exactly the way a mind-control status has it decide for a PlayerBrain cat
+// (FUN_140082B00): collect the targets (FUN_140139310), run the generic decision
+// (FUN_1408B44D0), copy the TurnAction into GetChoice's result (FUN_140034CB0).
+// Called inside the stream fence, so the AI's draws never move the sim stream;
+// the decision goes to the peer as an ordinary ACTION.
+static void pvp_auto_decide(void* brain, void* out) {
+    static ULONGLONG last = 0;
+    const ULONGLONG now = GetTickCount64();
+    // Wait out the previous action's animation, as a person does. Abilities queue
+    // deferred lambdas (Ability::trigger lambda_7, MeleeAttackAbility::OnTrigger
+    // lambda_2, Character::Face's own) that turn the cat when the clip reaches its
+    // frame; a decision applied before that lands is turned back afterwards on the
+    // owner only -- soak run 1 (2026-10-26) lost a backstab to exactly this.
+    if (now - last < 1500) return;
+    uint32_t type = 0;
+    if (!mem_read(out, &type, sizeof(type)) || type != TA_None) return;
+    uint8_t* base = (uint8_t*)GetModuleHandleW(nullptr);
+    using fn_targets = void* (__fastcall*)(void*, void*, void*, void*);
+    using fn_decide  = void* (__fastcall*)(void*, void*, void*, void*);
+    using fn_copy    = void* (__fastcall*)(void*, void*);
+    using fn_free    = void  (__cdecl*)(void*);
+    alignas(16) uint8_t vec[16] = {};
+    alignas(16) uint8_t ta[0x100] = {};
+    __try {
+        ((fn_targets)(base + 0x139310))(brain, vec, nullptr, nullptr);
+        ((fn_decide)(base + 0x8B44D0))(brain, ta, vec, nullptr);
+        ((fn_free)(base + 0xD4CB24))(*(void**)(vec + 8));
+        const uint32_t t = *(uint32_t*)ta;
+        // Undecided since when (per brain): the AI can keep answering "nothing" or
+        // a kind the wire does not carry -- a soak fight stood still for 12 min on
+        // one cat. After 15 s of that the cat simply ends its turn.
+        static void*     stuck_brain = nullptr;
+        static ULONGLONG stuck_since = 0;
+        if (t == TA_Ability || t == TA_EndTurn) {
+            ((fn_copy)(base + 0x34CB0))(out, ta);
+            last = now;
+            stuck_brain = nullptr;
+        } else {
+            if (stuck_brain != brain) { stuck_brain = brain; stuck_since = now; }
+            if (now - stuck_since > 15000) {
+                const uint32_t endturn = TA_EndTurn;
+                mem_write(out, &endturn, sizeof(endturn));
+                log_line("PVPAUTO", "the AI gave no usable decision for 15 s (last kind %u) -- ending the turn", t);
+                last = now;
+                stuck_brain = nullptr;
+            }
+        }
+        void* impl = *(void**)(ta + 0x78);   // the local TurnAction's std::function
+        if (impl) {
+            void** vt = *(void***)impl;
+            ((void(__fastcall*)(void*, bool))vt[4])(impl, impl != (void*)(ta + 0x40));
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        log_line("PVPAUTO", "!! fault in the AI decision -- this poll left undecided");
+    }
+}
+
 void* __fastcall h_GetChoice(void* self, void* out) {
+    // A human cat's GetChoice draws nothing -- unless a mind-control status has
+    // the AI deciding for it, which it then re-does on every poll. See
+    // lockstep_human_brain: the stream is put back for human cats on both peers.
+    uint64_t saved[4];
+    uint64_t* sim = nullptr;
+    if (lockstep_active() && lockstep_human_brain(self) && (sim = rng_global_stream()) != nullptr)
+        memcpy(saved, sim, sizeof(saved));
+    // Facing too: deciding for a human cat -- the auto AI, or a mind-control status
+    // inside the PlayerBrain -- ends with FUN_14013C460 ("orient", a Character::Face)
+    // on the endturn path. That runs on the deciding peer only (the other gets the
+    // bare ACTION), so the state fence puts the facing back on both.
+    // PvP soak 2026-10-26: two monsters picked swapped teleport tiles with equal
+    // streams. The brain's TargetOptimizer (*(Brain+0x48)) caches its distance
+    // maps keyed by the last Character it evaluated (+0x98, and +0xA0 for the
+    // water map) and reuses them when the key matches -- so a decision depends
+    // on what was evaluated before it, and the auto AI evaluates on the deciding
+    // peer only. In PvP every decision starts from a cold cache instead.
+    if (config().net_pvp && lockstep_active()) {
+        void* opt = nullptr;
+        if (mem_read((const uint8_t*)self + 0x48, &opt, sizeof(opt)) && opt) {
+            const uint64_t zero = 0;
+            mem_write((uint8_t*)opt + 0x98, &zero, sizeof(zero));
+            mem_write((uint8_t*)opt + 0xA0, &zero, sizeof(zero));
+        }
+    }
+    if (sim) { lockstep_state_fence_begin(); pvp_choice_fence(1); }
     void* ret = o_GetChoice(self, out);
+    if (sim && pvp_auto_on() && lockstep_local_human_brain(self)) pvp_auto_decide(self, ret);
+    if (sim) { pvp_choice_fence(0); lockstep_state_fence_end("a human cat's GetChoice", true); }
+    if (sim) memcpy(sim, saved, sizeof(saved));
 
     // --- run B: inject the recorded decision -----------------------------
     //
@@ -261,6 +348,7 @@ void __fastcall h_Trigger(void* self, void* ta) {
     Who    w(self, "abil");
     TaDump d(ta);
     log_line("TRIGGER", "%s %s", w.text, d.text);
+    pvp_before_trigger(self);
     o_Trigger(self, ta);
 }
 
@@ -601,8 +689,13 @@ void __fastcall h_ButtonUpdate(void* self) {
 // -- it exists in the signature so that rdx and the returned rax survive the
 // detour untouched.
 void* __fastcall h_UpdateDecision(void* self, void* out) {
+    // A human cat's preview must not roll an ability's X or turn it (see
+    // pvp_choice_fence); AI cats preview on both peers alike and are left alone.
+    const bool fence = lockstep_active() && lockstep_human_brain(self);
     lockstep_preview_facing_begin(self);
+    if (fence) pvp_choice_fence(1);
     void* ret = o_UpdateDecision(self, out);
+    if (fence) pvp_choice_fence(0);
     lockstep_preview_facing_end();
 
     // AFTER the original, deliberately. The game's own aim preview draws from
