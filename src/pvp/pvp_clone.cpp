@@ -48,6 +48,23 @@ bool safe_serialize(void* cat, void* bs) {
     __try { g.serialize(cat, bs, true); return true; } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
+// MewSaveFile::Load calls this after SerializeCatData. BodyParts stores the
+// part IDs in the stream, but derives their placement matrices from
+// CatHeadPlacements in the game's SWF. A fresh constructor leaves those zero.
+bool rebuild_appearance(void* cat) {
+    unsigned char saved[32];
+    auto tls = (unsigned char**)__readgsqword(0x58);
+    unsigned char* rng = tls && tls[0] ? tls[0] + 0x178 : nullptr;
+    if (rng) memcpy(saved, rng, sizeof saved);
+    bool ok = false;
+    __try {
+        ((void(__fastcall*)(void*))(g.base + 0x7393E0))((unsigned char*)cat + 0x60);
+        ok = true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    if (rng) memcpy(rng, saved, sizeof saved);
+    return ok;
+}
+
 bool bs_construct(uint8_t* bs) {
     memset(bs, 0, kByteStreamSize);
     if (!safe_ofstream_ctor(bs + kBS_Ofstream)) return false;
@@ -143,6 +160,10 @@ extern "C" void* pvp_clone_from_bytes(int slot, const uint8_t* data, uint32_t si
     bool ok = safe_serialize(c.cat, bs);
     safe_bs_dtor(bs);
     if (!ok) { log_line("PVP", "!! clone %d: SerializeCatData faulted", slot); return nullptr; }
+    if (!rebuild_appearance(c.cat)) {
+        log_line("PVP", "!! clone %d: body-part placement rebuild failed", slot);
+        return nullptr;
+    }
     c.key = PVP_CLONE_KEY_BASE + slot;
     *(long long*)((unsigned char*)c.cat + kCat_SqlKey) = c.key;
     return c.cat;

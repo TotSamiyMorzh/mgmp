@@ -290,7 +290,9 @@ static int hook(UINT_PTR rva, const unsigned char* expect, int len, void* fn, vo
 static const unsigned char kHouseInitEntry[14] = {
     0x48,0x89,0x5C,0x24,0x08, 0x55, 0x56, 0x57, 0x41,0x54, 0x41,0x55, 0x41,0x56 };
 static const char kArenaLevel[] = "pvp/a.lvl";
-static const char kArenaName[]  = "pvp";
+// The third StartHouseFight argument is a MUSIC BANK key, not the level name.
+// "pvp" has no entry in audio/music/music_info.gon and silently selects no song.
+static const char kArenaName[]  = "alley";
 
 typedef struct { union { char buf[16]; char* ptr; } u; unsigned long long size, cap; } msvc_string;
 typedef void (__fastcall *fn_house_init)(void*);

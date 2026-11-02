@@ -1,5 +1,11 @@
 Mewgenics PvP (mgmp) -- changelog
 
+1.1 refreshed build (2026-11-02; protocol 29)
+- Rebuild cloned cats' body-part placement matrices after deserialization,
+  matching the game's save loader so facial features retain their positions.
+- Use the existing alley music bank for arena fights instead of the missing
+  "pvp" bank, which left the arena silent.
+
 1.1  (2026-11-02)  (protocol 29; update both players)
 - Fixed random-X item synchronization (including Money Bag): random rolls occur
   at the shared ability-trigger boundary rather than per-frame checks.
