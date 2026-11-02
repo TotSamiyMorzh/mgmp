@@ -33,8 +33,13 @@ void pvp_before_trigger(void* ability);
 // 0 = no PvP session (hotseat), 1 = PvP host, 2 = PvP client. A session counts once
 // the handshake is complete and mgmp.json says net.mode = "pvp".
 int  pvp_net_mode(void);
+// Lobby can be opened while listening/connecting, before the handshake.
+int  pvp_lobby_mode(void);
 // Send one arena message to the other player. Returns 1 when it went out.
 int  pvp_net_send(uint8_t sub, const void* data, uint32_t size);
+uint64_t pvp_steam_id(void);
+int pvp_request_face(void* character, uint64_t direction, unsigned char instant);
+void pvp_apply_face(void* character, uint64_t direction, unsigned char instant);
 // Lockstep: the fight's identity, and who owns which cat (peer position 0 = host).
 void pvp_lockstep_enter(uint64_t battle_id);
 void pvp_lockstep_split(int (*owner)(const void* character));

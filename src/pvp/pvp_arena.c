@@ -29,6 +29,7 @@
 #include "pvp_mj_shim.h"
 #include "pvp_glue.h"
 #include "pvp_clone.h"
+#include "pvp_synctest.h"
 
 #include "lobby.h"
 // Online (see the end of the file). Declared up here for the hotseat code that
@@ -40,6 +41,7 @@ static void auto_button(unsigned char* btn);
 static void auto_hooks(void);
 static void intro_hooks(HMODULE self);
 static void face_hooks(void);
+static int split_owner(const void* character);
 static void roll_x_hooks(void);
 static int  net_open_lobby(const lobby_cat* cats, int n, const lobby_settings* s);
 static int  net_lobby_tick(void);
@@ -180,6 +182,7 @@ static void* g_mobs[MAX_MOBS];
 static int   g_mob_n;
 
 static void __fastcall hook_char_init(void* ch, void* gon, char a, char b) {
+    if (g_arena_active) pvp_test_spawn(ch, gon);
     flipped_set(ch, 0);
     for (int i = 0; i < MAX_BIRDS; i++) if (g_birds[i] == ch) g_birds[i] = NULL;
     g_orig_init(ch, gon, a, b);
@@ -2520,7 +2523,7 @@ void pvp_frame(void) {
     if (!find_house_scene() && !g_arena_active && !lobby_is_open()) return;   // nothing to do outside the house/arena
     int down = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
     if (down && !g_f9_down && game_has_focus() && !g_arena_active && !lobby_is_open()) {
-        if (pvp_net_mode()) open_lobby();   // online: never a one-machine quick fight
+        if (pvp_lobby_mode()) open_lobby();   // online: never a one-machine quick fight
         else start_arena();
     }
     g_f9_down = down;
@@ -2598,6 +2601,7 @@ static void* __fastcall hook_level_load(void* scene, void* a, void* path) {
 }
 
 void pvp_init(HMODULE self) {
+    pvp_test_init(self);
     g_rw_self = self;
     char path[MAX_PATH];
     GetModuleFileNameA(self, path, MAX_PATH);
@@ -2695,7 +2699,7 @@ void pvp_init(HMODULE self) {
 // sends a START with the rematch flag; a client's РЕВАНШ is a request to the host.
 // ДОМОЙ: either side, both go home (ACTION).
 
-enum { SUB_LOBBY_OPEN = 1, SUB_LOBBY_CLOSE = 2, SUB_SETTINGS = 3, SUB_PICK = 4, SUB_START = 5, SUB_ACTION = 6 };
+enum { SUB_LOBBY_OPEN = 1, SUB_LOBBY_CLOSE = 2, SUB_SETTINGS = 3, SUB_PICK = 4, SUB_START = 5, SUB_ACTION = 6, SUB_PROFILE = 7 };
 enum { NETACT_REMATCH = 1, NETACT_HOME = 2 };
 #define NET_MAX_SIDE 4
 #define NET_MAX_FIGHTERS (2 * NET_MAX_SIDE)
@@ -2781,6 +2785,11 @@ static void net_send_pick_and_rules(void) {
     uint64_t hs = fnv64(&s, sizeof s, 0xCBF29CE484222325ULL);
     unsigned long long now = GetTickCount64();
     int periodic = now >= g_sync_at;   // a peer that opened its lobby late still hears us
+    if (periodic) {
+        pvp_net_send(SUB_LOBBY_OPEN, NULL, 0);
+        uint64_t steam_id = pvp_steam_id();
+        pvp_net_send(SUB_PROFILE, &steam_id, sizeof steam_id);
+    }
     if (h != g_pick_sent_hash || periodic) {
         wbuf b = { NULL, 0, 0, 1 };
         wb_put(&b, name, 32);
@@ -2864,9 +2873,18 @@ static void roll_kits(const lobby_settings* s, int n1, int n2, char kits[][NUM_S
 
 static int split_owner(const void* character) {
     __try {
-        void* cat = *(void**)((const unsigned char*)character + OFF_CATDATA);
-        int t = cat ? team_of_cat(cat) : 0;
-        return t == 1 ? 0 : t == 2 ? 1 : -1;
+        const unsigned char* current = (const unsigned char*)character;
+        for (int depth = 0; current && depth < 16; depth++) {
+            void* cat = *(void**)(current + OFF_CATDATA);
+            int t = cat ? team_of_cat(cat) : 0;
+            if (t) return t == 1 ? 0 : 1;
+            const unsigned char* source = *(const unsigned char**)(current + 0x468);
+            // JoinSpawnerFaction checks the object's allocation generation too.
+            if (!source || source == current ||
+                *(const unsigned long long*)(source - 8) != *(const unsigned long long*)(current + 0x470)) break;
+            current = source;
+        }
+        return -1;
     } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
 }
 
@@ -2875,6 +2893,26 @@ static void arena_online_apply(const unsigned char* data, uint32_t size);
 // Host: build the fight's input, send it, apply it here too.
 static void host_start(int rematch) {
     lobby_settings* s = &g_fight_settings;
+    if (pvp_test_enabled()) {
+        uint8_t* replay = NULL;
+        uint32_t replay_len = pvp_test_replay(&replay);
+        if (replay_len) {
+            pvp_test_begin();
+            pvp_test_capture(replay, replay_len);
+            if (pvp_net_send(SUB_START, replay, replay_len)) arena_online_apply(replay, replay_len);
+            free(replay);
+            return;
+        }
+        uint64_t test_seed = pvp_test_begin();
+        s->item_preset = PRESET_RANDOM;
+        s->items_per_cat = 3 + (int)(test_seed % 3);
+        for (int i = 0; i < g_fight_n1 + g_fight_n2; i++) {
+            if (!pvp_test_cat(&g_fight_bytes[i], &g_fight_len[i], &g_fight_rows[i], i)) {
+                plog("synctest: fighter %d failed -- START cancelled", i);
+                return;
+            }
+        }
+    }
     // The level: placed with the host's rules, then shipped as bytes.
     g_level_fixed[0] = 0;
     g_cover_count = s->cover_count; g_cover_kind = s->cover_kind;
@@ -2920,6 +2958,7 @@ static void host_start(int rematch) {
     }
     free(lvl_bytes);
     if (!b.ok) { plog("net: !! START did not build"); free(b.p); return; }
+    pvp_test_capture(b.p, b.n);
     int sent = pvp_net_send(SUB_START, b.p, b.n);
     plog("net: START %s (%u bytes, battle %016llx, %d vs %d) %s", rematch ? "rematch" : "fight", b.n,
          (unsigned long long)battle_id, g_fight_n1, g_fight_n2, sent ? "sent" : "NOT SENT");
@@ -3049,7 +3088,7 @@ static void arena_online_apply(const unsigned char* data, uint32_t size) {
 // --- the hooks into the hotseat code -----------------------------------------
 
 static int net_open_lobby(const lobby_cat* cats, int n, const lobby_settings* s) {
-    int mode = pvp_net_mode();
+    int mode = pvp_lobby_mode();
     if (!mode) return 0;
     lobby_open_online(cats, n, s, mode == 1);
     if (g_remote_n) lobby_set_remote(g_remote_name, g_remote, g_remote_n);
@@ -3066,7 +3105,8 @@ static int net_lobby_tick(void) {
         return 1;
     }
     if (!lobby_is_online()) return 0;
-    if (!pvp_net_mode()) { plog("net: session gone -- closing the online lobby"); lobby_close(); return 1; }
+    if (!pvp_lobby_mode()) { plog("net: session gone -- closing the online lobby"); lobby_close(); return 1; }
+    if (!pvp_net_mode()) return 1; // waiting for the invited player's handshake
     if (lobby_is_open()) net_send_pick_and_rules();
     static lobby_cat chosen[LOBBY_MAX_CATS];
     int n = 0;
@@ -3101,6 +3141,12 @@ static int net_end_choice(int rematch) {
 void pvp_on_message(uint8_t from, uint8_t sub, const uint8_t* data, uint32_t size) {
     __try {
         switch (sub) {
+            case SUB_PROFILE:
+                if (size == sizeof(uint64_t) && lobby_is_online()) {
+                    uint64_t id; memcpy(&id, data, sizeof id);
+                    lobby_set_remote_steam(id);
+                }
+                break;
             case SUB_LOBBY_OPEN:
                 if (!lobby_is_open() && !g_arena_active && find_house_scene()) {
                     g_lobby_announce = 0;
@@ -3147,7 +3193,7 @@ void pvp_on_message(uint8_t from, uint8_t sub, const uint8_t* data, uint32_t siz
 // rules, and every HomeEvery fights goes home for new cats. Each event is a line
 // in pvp_auto.log; a halted lockstep stops the loop (the soak script collects the
 // logs and restarts both copies).
-static int                g_auto, g_auto_home_every = 3, g_auto_fight_minutes = 12;
+static int                g_auto, g_auto_home_every = 3, g_auto_fight_minutes;
 static FILE*              g_auto_log;
 static unsigned long long g_auto_t, g_auto_fight_t0, g_auto_end_seen;
 static int                g_auto_fights, g_auto_since_home, g_auto_halted, g_auto_rolled, g_auto_in_fight;
@@ -3171,7 +3217,7 @@ static void auto_init(HMODULE self) {
     g_auto = GetPrivateProfileIntA("auto", "Enabled", 0, ini);
     g_rw_enabled = GetPrivateProfileIntA("debug", "Watch", 0, ini);
     g_auto_home_every = GetPrivateProfileIntA("auto", "HomeEvery", 3, ini);
-    g_auto_fight_minutes = GetPrivateProfileIntA("auto", "FightMinutes", 12, ini);
+    g_auto_fight_minutes = GetPrivateProfileIntA("auto", "FightMinutes", 0, ini);
     if (!g_auto) return;
     char path[MAX_PATH];
     GetModuleFileNameA(self, path, MAX_PATH);
@@ -3205,6 +3251,7 @@ static void auto_roll(lobby_settings* s, int keep_team) {
     s->bird_mask = 1 + (int)rnd(7);
     s->bird_every = (int)rnd(4);        // 0 = only the starting birds
     s->bird_wave = 1 + (int)rnd(3);
+    if (pvp_test_enabled()) { s->team_max = 4; s->item_preset = PRESET_RANDOM; s->items_per_cat = 5; }
 }
 
 static void auto_describe(const lobby_settings* s, char* out, size_t n) {
@@ -3288,7 +3335,7 @@ static void auto_tick(void) {
             alog("fight %d over after %llu s", g_auto_fights, (now - g_auto_fight_t0) / 1000);
         }
         if (mode != 1) return;
-        int timed_out = !g_end_at && now - g_auto_fight_t0 > (unsigned long long)g_auto_fight_minutes * 60000ULL;
+        int timed_out = g_auto_fight_minutes > 0 && !g_end_at && now - g_auto_fight_t0 > (unsigned long long)g_auto_fight_minutes * 60000ULL;
         if ((g_auto_end_seen && now - g_auto_end_seen > 4000) || timed_out) {
             if (timed_out) alog("fight %d hit the %d min limit", g_auto_fights, g_auto_fight_minutes);
             g_auto_in_fight = 0;
@@ -3380,7 +3427,7 @@ static void auto_hooks(void) {
 
 // The game's opening cutscene ("game_intro", started by GameBase::init unless the
 // settings say dev_mode) runs ~a minute and cannot be avoided at boot. With
-// pvp.ini [probe] SkipIntro=1 (the default) it plays fast instead: a hook on
+// pvp.ini [probe] SkipIntro=1 (test opt-in only) it plays fast instead: a hook on
 // SwfCutscene::update (vtable slot 10, RVA 0x829A00) finds the cutscene by its
 // name (the std::string at +0x140 that the teardown turns into "cutscenes/<name>")
 // and sets its entity's time scale (Entity+0x10, the double every component's dt
@@ -3393,7 +3440,7 @@ static void auto_hooks(void) {
 static const unsigned char kCutsceneUpdateEntry[10] = { 0x48,0x8B,0xC4, 0x48,0x89,0x58,0x20, 0x55, 0x56, 0x57 };
 typedef void (__fastcall *fn_cutscene_update)(void*);
 static fn_cutscene_update g_orig_cutscene_update;
-static int g_skip_intro = 1;
+static int g_skip_intro = 0;
 
 static void __fastcall hook_cutscene_update(void* cs) {
     __try {
@@ -3413,7 +3460,7 @@ static void __fastcall hook_cutscene_update(void* cs) {
 static void intro_hooks(HMODULE self) {
     char ini[MAX_PATH];
     pvp_ini_path(self, ini);
-    g_skip_intro = GetPrivateProfileIntA("probe", "SkipIntro", 1, ini);
+    g_skip_intro = GetPrivateProfileIntA("probe", "SkipIntro", 0, ini);
     if (g_skip_intro)
         hook(RVA_CUTSCENE_UPDATE, kCutsceneUpdateEntry, 10, (void*)hook_cutscene_update,
              (void**)&g_orig_cutscene_update, "SwfCutscene::update (fast intro)");
@@ -3432,7 +3479,46 @@ static fn_face g_orig_face;
 static int     g_choice_fence;
 static long    g_face_swallowed;
 
-void pvp_choice_fence(int on) { g_choice_fence += on ? 1 : -1; if (g_choice_fence < 0) g_choice_fence = 0; }
+// PlayerBrain's explicit click-to-face path calls FaceTowards (10DEB0),
+// whereas hovering calls Face directly. Capture only that input, and retain
+// the preview fences. The resulting command goes through ACTION/QueueDecision.
+typedef void (__fastcall *fn_face_towards)(void*, unsigned long long, unsigned char);
+static fn_face_towards g_orig_face_towards;
+static void __fastcall hook_face_towards(void* ch, unsigned long long tile, unsigned char instant) {
+    if (g_arena_online && g_arena_active && g_choice_fence) {
+        unsigned long long direction = 0;
+        typedef void* (__fastcall *fn_direction)(void*, void*, unsigned long long);
+        ((fn_direction)((unsigned char*)GetModuleHandleA(NULL) + 0x10E1E0))(ch, &direction, tile);
+        pvp_request_face(ch, direction, instant);
+        return;
+    }
+    g_orig_face_towards(ch, tile, instant);
+}
+
+void pvp_apply_face(void* ch, uint64_t dir, unsigned char instant) {
+    if (g_orig_face) g_orig_face(ch, dir, 0, instant);
+}
+
+// Use the game's neutral tactical marker (amber) for arena units without a
+// player owner, including birds. Only the presentation string changes.
+typedef void* (__fastcall *fn_tactical_marker)(void*, void*);
+static fn_tactical_marker g_orig_tactical_marker;
+static void* __fastcall hook_tactical_marker(void* ch, void* out) {
+    void* result = g_orig_tactical_marker(ch, out);
+    if (g_arena_active && split_owner(ch) < 0) {
+        unsigned char* s = (unsigned char*)result;
+        if (*(size_t*)(s + 24) == 15 && *(size_t*)(s + 16) >= 7 &&
+            *(size_t*)(s + 16) <= 8 && memcmp(s, "enemy", 5) == 0) {
+            size_t n = *(size_t*)(s + 16);
+            memmove(s + 7, s + 5, n - 5 + 1);
+            memcpy(s, "neutral", 7);
+            *(size_t*)(s + 16) = n + 2;
+        }
+    }
+    return result;
+}
+
+void pvp_choice_fence(int on) { pvp_test_choice_scope(on); g_choice_fence += on ? 1 : -1; if (g_choice_fence < 0) g_choice_fence = 0; }
 
 static void __fastcall hook_face(void* ch, unsigned long long dir, char a, char b) {
     if (g_choice_fence && g_arena_online) {
@@ -3444,6 +3530,10 @@ static void __fastcall hook_face(void* ch, unsigned long long dir, char a, char 
 
 static void face_hooks(void) {
     hook(RVA_CHAR_FACE, kFaceEntry, 15, (void*)hook_face, (void**)&g_orig_face, "Character::Face (choice fence)");
+    static const unsigned char towards_entry[10] = {0x48,0x89,0x5C,0x24,0x08,0x57,0x48,0x83,0xEC,0x20};
+    static const unsigned char marker_entry[15] = {0x48,0x89,0x5C,0x24,0x08,0x48,0x89,0x74,0x24,0x10,0x48,0x89,0x7C,0x24,0x18};
+    hook(0x10DEB0, towards_entry, sizeof towards_entry, (void*)hook_face_towards, (void**)&g_orig_face_towards, "Character::FaceTowards (manual input)");
+    hook(0x11D770, marker_entry, sizeof marker_entry, (void*)hook_tactical_marker, (void**)&g_orig_tactical_marker, "Character tactical marker (neutral arena units)");
 }
 
 // Soak run 2026-10-26, session 12: wp_MoneyBag ("X_is random_0_to_N") scattered a
@@ -3463,10 +3553,21 @@ static fn_roll_x g_orig_roll_x;
 
 static void __fastcall hook_roll_x(void* ability) {
     if (g_choice_fence && g_arena_online) return;
+    // Can-use checks and stat refreshes also reroll X outside GetChoice.
+    // During an online arena random X is rolled only by the explicit
+    // g_orig_roll_x call in pvp_before_trigger, at the agreed action boundary.
+    if (g_arena_online && g_arena_active && ability) {
+        __try {
+            if (*(int*)((unsigned char*)ability + OFF_ABILITY_X_MODE) == 16) return;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+    uint64_t before = pvp_test_rng_hash();
     g_orig_roll_x(ability);
+    pvp_test_roll_x(ability, (uintptr_t)_ReturnAddress(), before);
 }
 
 void pvp_before_trigger(void* ability) {
+    if (g_arena_online && g_arena_active) pvp_test_trigger(ability);
     if (!g_arena_online || !g_arena_active || !g_orig_roll_x || !ability) return;
     __try {
         if (*(int*)((unsigned char*)ability + OFF_ABILITY_X_MODE) == 16) g_orig_roll_x(ability);

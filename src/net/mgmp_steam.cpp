@@ -48,6 +48,12 @@ using fn_friend_name= const char* (*)(void*, uint64_t);
 using fn_my_name    = const char* (*)(void*);
 using fn_relay      = void (*)(void*);
 using fn_register   = void (*)(void*, int);
+using fn_avatar     = int (*)(void*, uint64_t);
+using fn_request_user = bool (*)(void*, uint64_t, bool);
+using fn_image_size = bool (*)(void*, int, uint32_t*, uint32_t*);
+using fn_image_rgba = bool (*)(void*, int, uint8_t*, int);
+using fn_overlay    = void (*)(void*, const char*);
+using fn_overlay_enabled = bool (*)(void*);
 
 struct Api {
     fn_send send; fn_recv recv; fn_accept accept; fn_close_sess close_sess;
@@ -58,6 +64,10 @@ struct Api {
     fn_friend_cnt friend_cnt; fn_friend_at friend_at; fn_friend_game friend_game;
     fn_friend_name friend_name; fn_my_name my_name;
     fn_relay relay; fn_register reg;
+    fn_avatar avatar{}; fn_request_user request_user{};
+    fn_image_size image_size{}; fn_image_rgba image_rgba{};
+    fn_overlay overlay{}; fn_overlay_enabled overlay_enabled{};
+    void* image_utils = nullptr;
     void* msgs = nullptr; void* friends = nullptr; void* user = nullptr; void* utils = nullptr;
 };
 
@@ -186,6 +196,15 @@ bool init() {
         return false;
     }
     g.self = a.get_steamid(a.user);
+    // Optional presentation APIs must not disable the transport on older DLLs.
+    auto image_utils_v = (fn_iface)GetProcAddress(dll, "SteamAPI_SteamUtils_v010");
+    if (image_utils_v) a.image_utils = image_utils_v();
+    a.avatar = (fn_avatar)GetProcAddress(dll, "SteamAPI_ISteamFriends_GetMediumFriendAvatar");
+    a.request_user = (fn_request_user)GetProcAddress(dll, "SteamAPI_ISteamFriends_RequestUserInformation");
+    a.image_size = (fn_image_size)GetProcAddress(dll, "SteamAPI_ISteamUtils_GetImageSize");
+    a.image_rgba = (fn_image_rgba)GetProcAddress(dll, "SteamAPI_ISteamUtils_GetImageRGBA");
+    a.overlay = (fn_overlay)GetProcAddress(dll, "SteamAPI_ISteamFriends_ActivateGameOverlayInviteDialogConnectString");
+    a.overlay_enabled = (fn_overlay_enabled)GetProcAddress(dll, "SteamAPI_ISteamUtils_IsOverlayEnabled");
     const char* n = a.my_name(a.friends);
     strncpy_s(g.self_name, n ? n : "", _TRUNCATE);
 
@@ -218,6 +237,36 @@ bool steam_ready() {
 
 uint64_t    steam_self_id()   { return steam_ready() ? g.self : 0; }
 const char* steam_self_name() { return steam_ready() ? g.self_name : ""; }
+
+const char* steam_persona_name(uint64_t id) {
+    if (!id || !steam_ready()) return "";
+    const char* n = id == g.self ? g.api.my_name(g.api.friends) : g.api.friend_name(g.api.friends, id);
+    return n ? n : "";
+}
+
+int steam_avatar_handle(uint64_t id) {
+    if (!id || !steam_ready() || !g.api.avatar) return 0;
+    if (g.api.request_user) g.api.request_user(g.api.friends, id, false);
+    return g.api.avatar(g.api.friends, id);
+}
+
+bool steam_avatar_rgba(int image, uint8_t* rgba, int capacity, uint32_t* w, uint32_t* h) {
+    if (!steam_ready() || image <= 0 || !g.api.image_utils || !g.api.image_size || !g.api.image_rgba) return false;
+    if (!g.api.image_size(g.api.image_utils, image, w, h) || !*w || !*h || *w > 256 || *h > 256 ||
+        uint64_t(*w) * *h * 4 > uint64_t(capacity)) return false;
+    return g.api.image_rgba(g.api.image_utils, image, rgba, capacity);
+}
+
+bool steam_invite_overlay(uint64_t host, bool open) {
+    if (!host || !steam_ready() || !g.api.overlay || !g.api.image_utils || !g.api.overlay_enabled ||
+        !g.api.overlay_enabled(g.api.image_utils)) return false;
+    if (open) {
+        char connect[64];
+        _snprintf_s(connect, sizeof(connect), _TRUNCATE, "%s%llu", kConnectPrefix, (unsigned long long)host);
+        g.api.overlay(g.api.friends, connect);
+    }
+    return true;
+}
 
 bool steam_send(uint64_t peer, const void* data, uint32_t len) {
     if (!steam_ready() || !peer || !len) return false;

@@ -10,11 +10,13 @@ run continues until one of you wins it or loses it. Together.
 It is not an official feature and has nothing to do with the developers of
 Mewgenics. It is a hobby project built by reading the game's compiled code.
 
-Thanks [Claude](https://claude.ai/). The human didn't write even a single line of code.
+Developed with Claude Code (Anthropic) and Codex (OpenAI).
 
 ---
 
 ## PvP arena
+
+The current PvP release is **v1.1**, for Mewgenics **1.1.21239** (protocol **29**; update both players). Download the player archive from [GitHub Releases](https://github.com/TotSamiyMorzh/mgmp/releases/tag/v1.1); see [installation instructions](package/README.txt) and [changes](package/CHANGELOG.txt).
 
 The same lockstep core also runs a **PvP mode** (`src/pvp`, `net.mode = "pvp"`):
 two players fight each other with the cats from their **own** saves, connected

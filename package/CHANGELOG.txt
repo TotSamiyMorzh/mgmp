@@ -1,5 +1,19 @@
 Mewgenics PvP (mgmp) -- changelog
 
+1.1  (2026-11-02)  (protocol 29; update both players)
+- Fixed random-X item synchronization (including Money Bag): random rolls occur
+  at the shared ability-trigger boundary rather than per-frame checks.
+- Human-controlled summons inherit their summoner's ownership and cannot be
+  controlled by both players.
+- Steam persona names and avatars in the lobby, with an Invite overlay button.
+- Unowned arena monsters and birds use the neutral tactical marker colour.
+- Opening cinematic uses normal game behaviour by default (SkipIntro=0).
+- Manual turn-in-place input is an ordered lockstep action; PvP hashes also
+  compare facing. Hover/decision previews retain their synchronization fences.
+- Automatic test fights have no individual timeout by default (FightMinutes=0).
+- Added a separately enabled synthetic-cat stress harness for development; the
+  player release is built with MGMP_SYNCTEST=OFF.
+
 1.0.0  (2026-10-26)  first release
 - Online PvP arena between two players' own houses: each picks cats from their
   own save, the fight is deterministic lockstep, and both games check every turn.

@@ -27,6 +27,10 @@ bool steam_ready();
 
 uint64_t    steam_self_id();
 const char* steam_self_name();       // UTF-8, "" when unknown
+const char* steam_persona_name(uint64_t id);
+int steam_avatar_handle(uint64_t id);
+bool steam_avatar_rgba(int image, uint8_t* rgba, int capacity, uint32_t* width, uint32_t* height);
+bool steam_invite_overlay(uint64_t host, bool open = false);
 
 // Reliable, ordered, one message per call. False when Steam refused it.
 bool steam_send(uint64_t peer, const void* data, uint32_t len);

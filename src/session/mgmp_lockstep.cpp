@@ -203,6 +203,10 @@ struct State {
     uint32_t  pend_head = 0, pend_count = 0;
 
     bool     outstanding = false;   // a local decision is sent but not applied
+    const void* face_actor = nullptr;
+    uint64_t face_direction = 0, face_battle = 0;
+    uint32_t face_turn = 0;
+    uint8_t face_instant = 0;
     uint32_t turn        = 0;
 
     // Which battle. Turn numbering restarts at 0 in each one, so the turn index
@@ -705,6 +709,38 @@ uint8_t cat_index_of(const void* character) {
     for (uint32_t i = 0; i < g.cat_count; ++i)
         if (g.cats[i] == character) return (uint8_t)i;
     return kNoCat;
+}
+
+// Append only human-controlled summons in live-list order. Never renumber the
+// starting roster. Both peers see the same deterministic spawn order and resolve
+// ownership through the arena's validated creator chain, not mutable factions.
+void refresh_human_summons() {
+    if (!g.active || !g.snapped || !g.control_checked || !g_split_owner || g.halted) return;
+    uint32_t count = 0;
+    const void* data = nullptr;
+    if (!mem_read((const uint8_t*)g.snapped_list + kList_Count, &count, sizeof count) ||
+        !mem_read((const uint8_t*)g.snapped_list + kList_Data, &data, sizeof data) ||
+        !data || count > kMaxCats) return;
+    for (uint32_t i = 0; i < count; ++i) {
+        const void* ch = nullptr;
+        const void* brain = nullptr;
+        char name[96] = {};
+        if (!mem_read((const uint8_t*)data + i * sizeof(void*), &ch, sizeof ch) || !ch ||
+            !mem_read((const uint8_t*)ch + kChar_Brain, &brain, sizeof brain) || !brain) continue;
+        rtti_class_name(brain, name, sizeof name);
+        if (!strstr(name, tune::kReplayBrains)) continue;
+        const int owner = g_split_owner(ch);
+        if (owner < 0) continue;
+        uint8_t slot = cat_index_of(ch);
+        if (slot == kNoCat) {
+            if (g.cat_count >= kMaxCats) { halt("human summon roster capacity exceeded"); return; }
+            slot = (uint8_t)g.cat_count++;
+            g.cats[slot] = ch;
+            log_line("LOCKSTEP", "human summon registered: cat %u owner position %d", slot, owner);
+        }
+        g.human_cat[slot] = true;
+        g.local_cat[slot] = (uint32_t)owner == net_peer_pos();
+    }
 }
 
 // Snapshot the battle's character list. Called once per battle, at the first
@@ -1409,7 +1445,9 @@ HashMsg build_hash(void* turn_control) {
     // TimeDelayStatusApplication: wall-clock time reaching something we treat as
     // simulation state.
     //
-    // Excluding it is safe rather than merely convenient, and the reason is
+    // The historical co-op exclusion below is retained there. PvP now fences
+    // previews and replicates manual facing, so PvP hashes fx/fy as well.
+    // The original reasoning for the co-op exclusion was:
     // narrow: every SIMULATION write to facing is made by the action itself --
     // Ability::trigger and Character::DoAction both call Face with the committed
     // direction. The preview write only survives in the gap BETWEEN actions, so
@@ -1462,6 +1500,13 @@ HashMsg build_hash(void* turn_control) {
             sh = fnv1a(&st.maxhp,  sizeof(st.maxhp),  sh);
             sh = fnv1a(&st.tx,     sizeof(st.tx),     sh);
             sh = fnv1a(&st.ty,     sizeof(st.ty),     sh);
+            // PvP fences preview writes and orders manual turns as ACTIONs.
+            // Check facing too: backstab damage must never depend on a local
+            // hover or an unreplicated stationary turn.
+            if (config().net_pvp) {
+                sh = fnv1a(&st.fx, sizeof(st.fx), sh);
+                sh = fnv1a(&st.fy, sizeof(st.fy), sh);
+            }
             sh = fnv1a(&st.dead,   sizeof(st.dead),   sh);
             sh = fnv1a(&st.linked, sizeof(st.linked), sh);
             // The elements affecting this cat -- passives, statuses, equipment
@@ -2277,7 +2322,20 @@ void lockstep_pump() {
 // Defined just below, after its first caller.
 static void apply_remote(const ActionMsg& msg, const void* actor, void* out);
 
+bool lockstep_request_face(void* actor, uint64_t direction, uint8_t instant) {
+    if (!config().net_pvp || !g.active || !g.snapped || g.halted || g.outstanding) return false;
+    uint8_t cat = cat_index_of(actor);
+    if (cat == kNoCat || !g.local_cat[cat] || !g.human_cat[cat]) return false;
+    int32_t x = int32_t(direction), y = int32_t(direction >> 32);
+    if (!((x == 0 && (y == -1 || y == 1)) || (y == 0 && (x == -1 || x == 1)))) return false;
+    g.face_actor = actor; g.face_direction = direction;
+    g.face_battle = g.battles.current; g.face_turn = g.turn;
+    g.face_instant = instant != 0;
+    return true;
+}
+
 bool lockstep_fill_choice(void* brain, void* out) {
+    refresh_human_summons();
     if (!g.active || !brain || !out) return false;
     if (g.halted) {
         // Freeze both peers rather than let one run on. Forcing type=1 parks
@@ -2382,7 +2440,17 @@ bool lockstep_fill_choice(void* brain, void* out) {
 
         TurnAction a{};
         if (!mem_read(out, &a, sizeof(a))) return false;
-        if (a.type != TA_Ability && a.type != TA_EndTurn) return false;
+        if (g.face_actor && (g.face_battle != g.battles.current || g.face_turn != g.turn)) g.face_actor = nullptr;
+        if (a.type == TA_Ability || a.type == TA_EndTurn) g.face_actor = nullptr;
+        if (a.type == TA_None && g.face_actor == actor) {
+            a = {};
+            a.type = TA_Face;
+            a.dir_x = int32_t(g.face_direction); a.dir_y = int32_t(g.face_direction >> 32);
+            a.tail[0x31 - 0x28] = g.face_instant;
+            g.face_actor = nullptr;
+            mem_write(out, &a, sizeof a);
+        }
+        if (a.type != TA_Ability && a.type != TA_EndTurn && a.type != TA_Face) return false;
 
         ActionMsg msg{};
         msg.battle_id = g.battles.current;
@@ -2421,7 +2489,7 @@ bool lockstep_fill_choice(void* brain, void* out) {
             g.outstanding = true;
             ++g.stats.sent;
             log_line("LOCKSTEP", "-> cat %u %s slot=%u:%u target=(%d,%d) gon=%s",
-                     (unsigned)cat, a.type == TA_EndTurn ? "endturn" : "ability",
+                     (unsigned)cat, a.type == TA_Face ? "face" : a.type == TA_EndTurn ? "endturn" : "ability",
                      msg.slot_kind, msg.slot_index, msg.tx, msg.ty,
                      msg.gon[0] ? msg.gon : "-");
         }
@@ -2496,7 +2564,7 @@ static void apply_remote(const ActionMsg& msg, const void* actor, void* out) {
     mem_write(out, &a, sizeof(a));
     ++g.stats.applied;
     log_line("LOCKSTEP", "<- cat %u %s slot=%u:%u target=(%d,%d) gon=%s",
-             (unsigned)cat, msg.type == TA_EndTurn ? "endturn" : "ability",
+             (unsigned)cat, msg.type == TA_Face ? "face" : msg.type == TA_EndTurn ? "endturn" : "ability",
              msg.slot_kind, msg.slot_index, msg.tx, msg.ty,
              msg.gon[0] ? msg.gon : "-");
 }
@@ -2509,7 +2577,7 @@ void lockstep_on_applied(const void* action, const void* actor) {
 
     // Types 6 and 7 are generated locally on both peers and are never sent.
     // They must not clear the outstanding guard or advance anything.
-    if (a.type != TA_Ability && a.type != TA_EndTurn) return;
+    if (a.type != TA_Ability && a.type != TA_EndTurn && a.type != TA_Face) return;
 
     // Match the recorder's precedence exactly (mgmp_hooks.cpp, h_ApplyAction):
     // prefer the action's own actor, fall back to TurnControl's current one.
@@ -2612,6 +2680,7 @@ void lockstep_turn_boundary(void* turn_control) {
     }
 
     snapshot_cats(turn_control);
+    refresh_human_summons();
     if (!g.snapped || g.halted) return;
 
     Guard guard;
@@ -2692,6 +2761,7 @@ uint64_t lockstep_battle_id()  { return g.active ? g.battles.current : kNoBattle
 bool     lockstep_local_actor(){ return g.active && g.snapped && g.local_actor; }
 
 bool lockstep_human_brain(const void* brain) {
+    refresh_human_summons();
     if (!g.active || !g.snapped || !brain) return false;
     const void* actor = nullptr;
     if (!mem_read((const uint8_t*)brain + kBrain_Owner, &actor, sizeof(actor)) || !actor)

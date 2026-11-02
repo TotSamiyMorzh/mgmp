@@ -76,6 +76,16 @@ int main() {
         }
     }
 
+    printf("\n-- Stationary facing is an ordered, bounded command --\n");
+    for (int x = -2; x <= 2; ++x) for (int y = -2; y <= 2; ++y) {
+        ActionMsg a{}; a.type = 128; a.dx = x; a.dy = y;
+        uint32_t n = enc_action(buf, sizeof buf, a);
+        Reader r(buf, n); r.u8v(); ActionMsg b{};
+        bool cardinal = (x == 0 && (y == -1 || y == 1)) || (y == 0 && (x == -1 || x == 1));
+        check(dec_action(r, b) == cardinal, "only the four cardinal facings decode");
+        if (cardinal) check(b.dx == x && b.dy == y && b.type == 128, "facing survives encoding");
+    }
+
     printf("\n-- Hello and the data-identity fields --\n");
     {
         Hello h{};

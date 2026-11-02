@@ -88,6 +88,7 @@ int  lobby_take_start(lobby_cat* cats, int* n, lobby_settings* s);
 void lobby_open_online(const lobby_cat* cats, int n, const lobby_settings* s, int is_host);
 // The other player's name and picked cats (from their PICK message).
 void lobby_set_remote(const char* name, const lobby_cat* cats, int n);
+void lobby_set_remote_steam(unsigned long long id);
 // Client: the host's rules (this player's own name is kept).
 void lobby_set_settings(const lobby_settings* s);
 // This player's picks (in pick order), name and current rules. Returns the count.

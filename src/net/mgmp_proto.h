@@ -2,7 +2,8 @@
 //
 // WHAT GOES ON THE WIRE, AND WHY IT IS SO LITTLE.
 //
-// Only TurnAction types 2 (use ability) and 3 (end turn) are ever transmitted.
+// Decisions 2 (ability), 3 (end turn), and mod command 128 (manual facing)
+// are transmitted. Version 29 adds ordered manual facing; both peers must update.
 // Types 6 (reaction broadcast) and 7 (invoke a std::function) are generated
 // locally on both peers and must NOT be sent -- settled exhaustively in phase 1:
 //
@@ -53,7 +54,7 @@ namespace mgmp {
 // diagnosing it from a turn-0 halt is not.
 // 28: PVP -- one envelope for the PvP arena's own messages (src/pvp): a sub-type
 // byte and an opaque blob the arena encodes itself.
-constexpr uint32_t kProtoVersion = 28;
+constexpr uint32_t kProtoVersion = 29;
 // history: 2 CONTROL, 3 ENTERNODE, 4 SAVEFILE, 5 epoch, 6 CATDATA, 7 INVENTORY, 8 state hash drops facing + roster cap 254, 9 peer envelope + PEERS (up to 4 players), 10 state hash gains ElementList (tiles + equipment), 11 CURSOR, 12 state hash gains live-list membership and stops hashing departed cats, 13/14/15 CURSOR churn while the pointer moved from the board to the screen, 16 CURSOR carries the cursor-art index -- the peer's pointer is now the game's own texture for the state their game is in, 17 CHOICE -- event and level-up option choices, which is what replaces RUNSTATE, 18 the per-battle epoch COUNTER becomes a u64 battle_id -- the node seed both peers already share -- so battle identity survives a peer restarting, 19 CHOICE carries the node seed it was made on -- a held choice used to have no idea which node it belonged to and could surface on a later one, 20 RUNHIST (the run-history object the event roller reads) + NODEHASH (the meta layer finally gets the per-node check the battle layer has had per turn since version 5), 21 AIM -- the range/AOE tiles the other player is aiming at, drawn on this peer by the game's own Brain::DrawAbilityAOE; cosmetic like CURSOR and hashed by nothing, 22 AIM is read from the PLAYERBRAIN'S SELECTION (PlayerBrain+0x3D8/+0x358/+0x360) instead of the cached decision, and the receiver draws the RANGE tiles as well as the AOE -- not one byte of AimMsg moved, which is exactly the kind of change version 12 established has to bump anyway, 23 the range-tile call that came with 22 is REMOVED -- sub_140138A10 applies statuses rather than drawing, so mirroring it mutated the non-owning peer's simulation and cost a run; the bump exists so a peer still running 22 cannot join and do it, 24 the highlight is back and the tiles with it, but only ever called with sub_140151CE0 -- its apply_status half -- swallowed by T_HighlightRefresh and with the whole roster's cat state fenced across the call, 25 a Move aim also shows the ATTACK RANGE from the hovered square -- the game gets those tiles by displacing the cat and moving it back, so the receiver now makes two TacticsObject::Move calls per frame inside the same state fence; not one byte of AimMsg moved, version 12's rule again, 26 STATEDUMP -- on a hash mismatch each peer sends the per-cat table its own hash was taken over, so the log that halts also names the cat and the field instead of requiring two log files side by side, 27 SAVEFILE carries `fresh` -- whether the host is (re)starting a run from the save screen or catching a peer up. A host that goes back to the menu and picks a slot again starts a NEW run, and the client used to decline that save with "already in the run": the g.applied latch is per-PROCESS and the two sends were byte-identical, so nothing on the receiving side could tell them apart, and HOSTLEFT -- the other half of that story: `fresh` handles the host STARTING a run, HOSTLEFT handles it ENDING one. Both shipped in the same unreleased version, which is the only reason they share a number
 
 // A frame's payload may not exceed this. RUNSTATE (phase 5) is the only message
@@ -397,7 +398,7 @@ struct ActionMsg {
     uint64_t battle_id  = 0;   // which battle; see above
     uint32_t turn       = 0;
     uint8_t  actor      = 0;   // cat index; a cross-check, see mgmp_lockstep.h
-    uint8_t  type       = 0;   // 2 = ability, 3 = end turn. Never 6 or 7.
+    uint8_t  type       = 0;   // 2 = ability, 3 = end turn, 128 = manual face. Never 6 or 7.
     uint8_t  slot_kind  = 0;   // SLOT_* from mgmp_ability.h
     uint8_t  slot_index = 0;
     uint8_t  b30        = 0;   // TurnAction+0x30, forwarded to Ability::Prime
@@ -1173,7 +1174,10 @@ inline bool dec_action(Reader& r, ActionMsg& a) {
     // Reject anything that is not a real decision at the edge. Types 6 and 7
     // are locally generated; if one ever arrives, the sender is broken and
     // applying it would double-fire a reaction on this peer.
-    return r.ok && (a.type == 2 || a.type == 3);
+    return r.ok && (a.type == 2 || a.type == 3 ||
+        (a.type == 128 && a.b31 <= 1 &&
+         ((a.dx == 0 && (a.dy == -1 || a.dy == 1)) ||
+          (a.dy == 0 && (a.dx == -1 || a.dx == 1)))));
 }
 
 inline bool dec_hash(Reader& r, HashMsg& h) {

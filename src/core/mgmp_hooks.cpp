@@ -27,6 +27,7 @@
 // Character::DoAction -- which fired exactly 12 times for 12 decisions -- is the
 // real command boundary for lockstep.
 #include "mgmp_ability.h"
+#include "pvp_synctest.h"
 #include "mgmp_addresses.h"
 #include "mgmp_catsync.h"
 #include "mgmp_combatlock.h"
@@ -285,7 +286,7 @@ void* __fastcall h_GetChoice(void* self, void* out) {
     }
     if (sim) { lockstep_state_fence_begin(); pvp_choice_fence(1); }
     void* ret = o_GetChoice(self, out);
-    if (sim && pvp_auto_on() && lockstep_local_human_brain(self)) pvp_auto_decide(self, ret);
+    if (sim && pvp_auto_on() && lockstep_local_human_brain(self) && !pvp_test_manual_face(self)) pvp_auto_decide(self, ret);
     if (sim) { pvp_choice_fence(0); lockstep_state_fence_end("a human cat's GetChoice", true); }
     if (sim) memcpy(sim, saved, sizeof(saved));
 
@@ -350,6 +351,7 @@ void __fastcall h_Trigger(void* self, void* ta) {
     log_line("TRIGGER", "%s %s", w.text, d.text);
     pvp_before_trigger(self);
     o_Trigger(self, ta);
+    if (pvp_test_enabled()) pvp_test_trigger_end(self);
 }
 
 void __fastcall h_BeginTurn(void* self, int arg) {
@@ -419,6 +421,21 @@ void __fastcall h_ApplyAction(void* self, void* ta) {
     // mutates the slot at TurnControl+0x90 on its way through.
     if (replay_active())   replay_on_applied(ta, current_actor(self));
     if (lockstep_active()) lockstep_on_applied(ta, current_actor(self));
+
+    // Explicit stationary turning is queued in lockstep, outside every preview
+    // fence. Face's own deferred callbacks are consequently generated on both
+    // peers at the same action boundary, rather than on a mouse-hover frame.
+    TurnAction facing{};
+    if (config().net_pvp && lockstep_active() && mem_read(ta, &facing, sizeof facing) && facing.type == TA_Face) {
+        const void* actor = current_actor(self);
+        if (actor) {
+            uint64_t dir = uint32_t(facing.dir_x) | (uint64_t(uint32_t(facing.dir_y)) << 32);
+            pvp_apply_face(const_cast<void*>(actor), dir, facing.tail[0x31 - 0x28]);
+        }
+        const uint32_t idle = 0;
+        mem_write((uint8_t*)self + 0x90, &idle, sizeof idle);
+        return;
+    }
 
     o_ApplyAction(self, ta);
 }

@@ -1,11 +1,11 @@
-﻿Mewgenics PvP (mgmp) 1.0.0  --  English first, русский ниже
+﻿Mewgenics PvP (mgmp) 1.1  --  English first, русский ниже
 ===========================================================
 
 ENGLISH
 -------
 
 What both computers need
-- Mewgenics on Steam, the same game version (mgmp checks the game data when the
+- Mewgenics 1.1.21239 on Steam, the same game version (mgmp checks the game data when the
   players connect and refuses a mismatch).
 - This whole folder. Put it on the same drive as the Steam game, so the game
   copy is made of hard links and takes no space.
@@ -22,9 +22,13 @@ Once on each computer: setup.bat
 - After every game update, run setup.bat again (game\ still holds the old
   version otherwise, and the two players would not match).
 
+Updating from 1.0.0
+- Update BOTH computers to 1.1 (network protocol 29). Mixed versions cannot connect.
+- Replace the mod files with this release; keep your local game folder.
+
 Host (creates the game)
 1. Steam is running.
-2. Run host.bat. The game opens; the intro flies by.
+2. Run host.bat. The game opens with its normal intro.
 3. That is all: the host can be joined over Steam and over the network (TCP 27600).
 
 Client (joins) -- over Steam, no ports, no IP
@@ -45,6 +49,10 @@ In the game
 - Both: Play -> your own save -> you are in the house.
 - The host opens the PvP arena (the "ARENA" button in the pause menu (ESC), or
   F9); the client's lobby opens by itself.
+- The lobby shows Steam names and avatars. The host can open it before a friend
+  connects and use Invite at the top to open Steam's invitation dialog.
+- Neutral monsters and birds use amber tactical markers (Ctrl). Manual turns
+  in place are synchronized, including their effect on backstab damage.
 - Each player picks their own cats by clicking a row. With "Items: From home"
   each player has an "ITEMS FROM HOME" button and dresses their cats from their
   own storage.
@@ -74,7 +82,7 @@ Steam game folder was never changed.
 Credits
 - Built on mgmp (Mewgenics multiplayer), MIT License, by SanTertrust.
 - Uses MinHook, Dear ImGui, nlohmann/json, stb_image and the game's own Steam API (Steam networking).
-- Written with the help of an AI coding agent (Claude Code, Anthropic).
+- Developed with Claude Code (Anthropic) and Codex (OpenAI).
 - Not affiliated with Glaiel Games or Edmund McMillen. Mewgenics is theirs.
 
 
@@ -82,7 +90,7 @@ Credits
 -------
 
 Что нужно на ОБОИХ компах
-- Mewgenics в Steam, одна и та же версия игры (иначе mgmp откажется соединяться:
+- Mewgenics 1.1.21239 в Steam, одна и та же версия игры (иначе mgmp откажется соединяться:
   он сверяет данные игры при подключении).
 - Эта папка целиком. Положите её на тот же диск, где стоит игра в Steam
   (тогда копия игры делается жёсткими ссылками и не занимает места).
@@ -99,9 +107,13 @@ Credits
   потеряет свои настройки.
 - После каждого обновления игры запустите setup.bat ещё раз (иначе в game  останется старая версия и у игроков не совпадут данные).
 
+Обновление с 1.0.0
+- Обновите ОБА компьютера до 1.1 (сетевой протокол 29). Разные версии несовместимы.
+- Замените файлы мода файлами релиза; локальную папку game можно оставить.
+
 Хост (кто создаёт игру)
 1. Steam запущен.
-2. Запустите host.bat. Игра откроется, интро пролетит быстро.
+2. Запустите host.bat. Игра откроется с обычной заставкой.
 3. Всё: хост сразу доступен и через Steam, и по сети (порт 27600).
 
 Клиент (кто подключается) — через Steam, без портов и IP
@@ -122,6 +134,10 @@ Credits
 - Оба: Play -> свой сейв -> вы в доме.
 - Хост открывает PvP-арену (кнопка «АРЕНА» в меню паузы (ESC) или F9) — у
   клиента лобби откроется само.
+- В лобби отображаются Steam-ники и аватарки. Хост может открыть его заранее
+  и нажать сверху «Пригласить» — откроется меню приглашения Steam.
+- Нейтральные монстры и птицы имеют янтарные тактические маркеры (Ctrl).
+  Повороты на месте синхронизируются, включая влияние на урон в спину.
 - Каждый выбирает своих котов кликом по строке. При «Вещи: Из дома» у каждого
   есть кнопка «ВЕЩИ ИЗ ДОМА» — одеваете своих котов из своего хранилища.
 - Правила (укрытия, лут, монстры, птицы, волны) ставит хост. СТАРТ жмёт хост.
@@ -149,5 +165,5 @@ Steam не менялась.
 Авторы
 - Основано на mgmp (мультиплеер для Mewgenics), лицензия MIT, автор SanTertrust.
 - Использует MinHook, Dear ImGui, nlohmann/json, stb_image и Steam API самой игры (сеть Steam).
-- Написано с помощью ИИ-агента (Claude Code, Anthropic).
+- Разработано с помощью Claude Code (Anthropic) и Codex (OpenAI).
 - Не связано с Glaiel Games и Эдмундом Макмилленом. Mewgenics принадлежит им.

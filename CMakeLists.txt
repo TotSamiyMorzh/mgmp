@@ -12,7 +12,7 @@
 # generators such as Visual Studio) or build\mgmp.dll directly (Ninja / NMake,
 # single-config). tools\net_test.ps1 handles both layouts.
 cmake_minimum_required(VERSION 3.21)
-project(mgmp LANGUAGES C CXX)
+project(mgmp VERSION 1.1.0 LANGUAGES C CXX)
 
 if(NOT WIN32)
     message(FATAL_ERROR "mgmp targets Mewgenics.exe, a Windows x64 PE -- see CLAUDE.md")
@@ -27,6 +27,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 option(MGMP_BUILD_TESTS "build the pure-logic unit tests in tests/" ON)
+option(MGMP_SYNCTEST "compile the opt-in synthetic-cat sync stress harness" OFF)
 
 # third_party/minhook ships its own CMakeLists.txt (BUILD_SHARED_LIBS is OFF
 # by default there, which is what we want: a static lib folded into mgmp.dll,
@@ -89,6 +90,7 @@ add_library(mgmp SHARED
     # arena, referee, lobby, portraits. See src/pvp/pvp_glue.h for the seams.
     src/pvp/pvp_glue.cpp
     src/pvp/pvp_clone.cpp
+    src/pvp/pvp_synctest.cpp
     src/pvp/pvp_arena.c
     src/pvp/lobby.cpp
     src/pvp/portraits.cpp
@@ -105,6 +107,9 @@ set_target_properties(mgmp PROPERTIES OUTPUT_NAME "mgmp" PREFIX "")
 target_compile_definitions(mgmp PRIVATE
     WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS NOMINMAX
 )
+if(MGMP_SYNCTEST)
+    target_compile_definitions(mgmp PRIVATE MGMP_SYNCTEST=1)
+endif()
 target_compile_options(mgmp PRIVATE /W3)
 # Flat quoted includes (#include "mgmp_hooks.h") resolve across folders via
 # these four dirs, so moving a file between layers never touches an #include.

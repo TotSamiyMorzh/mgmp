@@ -193,5 +193,7 @@ void     lockstep_state_fence_begin();
 // restore_vitals: also put HP, shield and max HP back (not for a cat that died).
 uint32_t lockstep_state_fence_end(const char* what, bool restore_vitals = false);
 uint32_t lockstep_state_fence_hits();
+// Explicit PlayerBrain turn-in-place input; consumed as an ordered action.
+bool lockstep_request_face(void* character, uint64_t direction, uint8_t instant);
 
 } // namespace mgmp

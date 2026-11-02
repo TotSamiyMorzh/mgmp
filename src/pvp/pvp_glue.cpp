@@ -14,6 +14,12 @@
 #include "mgmp_net.h"
 #include "mgmp_proto.h"
 #include "mgmp_session.h"
+#include "mgmp_steam.h"
+
+extern "C" uint64_t pvp_steam_id(void) { return mgmp::steam_self_id(); }
+extern "C" int pvp_request_face(void* ch, uint64_t dir, unsigned char instant) {
+    return mgmp::lockstep_request_face(ch, dir, instant) ? 1 : 0;
+}
 
 extern "C" int MJ_Require(const char*) { return 1; }
 
@@ -40,6 +46,12 @@ extern "C" int MJ_Resolve(MewjectorAPI* api) {
 extern "C" int pvp_net_mode(void) {
     using namespace mgmp;
     if (!config().net_pvp || !net_active() || !session_ready()) return 0;
+    return net_role() == NetRole::Host ? 1 : net_role() == NetRole::Client ? 2 : 0;
+}
+
+extern "C" int pvp_lobby_mode(void) {
+    using namespace mgmp;
+    if (!config().net_pvp || !net_active()) return 0;
     return net_role() == NetRole::Host ? 1 : net_role() == NetRole::Client ? 2 : 0;
 }
 

@@ -27,6 +27,7 @@
 #define STBI_NO_STDIO
 #include "stb_image.h"
 #include "portraits.h"
+#include "mgmp_steam.h"
 
 // The lobby follows the game language: English unless the game is in Russian
 // (lobby_set_english, from the arena at startup). Decided once, before the first
@@ -56,6 +57,7 @@ struct Lobby {
     bool      online = false, is_host = false;
     int       my_team = 0;
     char      remote_name[32] = {};
+    uint64_t  remote_steam = 0;
     lobby_cat remote[8];
     int       nremote = 0;
     bool      cancelled = false;
@@ -285,27 +287,84 @@ int team_order(int t, int* idx) {
     return n;
 }
 
+// Preserve complete unpack state: the game's atlas uploader uses row lengths
+// and buffer objects, and ImGui's render-state guard runs after this upload.
+GLuint steam_portrait(int t, uint64_t id) {
+    struct Portrait { uint64_t id = 0; int handle = 0; GLuint tex = 0; ULONGLONG next = 0; };
+    static Portrait cache[2];
+    Portrait& c = cache[t - 1];
+    if (c.id != id) { if (c.tex) glDeleteTextures(1, &c.tex); c = {}; c.id = id; }
+    if (!id || GetTickCount64() < c.next) return c.tex;
+    c.next = GetTickCount64() + 2000;
+    int handle = mgmp::steam_avatar_handle(id);
+    if (handle <= 0 || (handle == c.handle && c.tex)) return c.tex;
+    uint8_t rgba[256 * 256 * 4]; uint32_t w = 0, h = 0;
+    if (!mgmp::steam_avatar_rgba(handle, rgba, sizeof rgba, &w, &h)) return c.tex;
+    GLint binding, alignment, row, skip_rows, skip_pixels, buffer;
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &binding);
+    glGetIntegerv(GL_UNPACK_ALIGNMENT, &alignment);
+    glGetIntegerv(GL_UNPACK_ROW_LENGTH, &row);
+    glGetIntegerv(GL_UNPACK_SKIP_ROWS, &skip_rows);
+    glGetIntegerv(GL_UNPACK_SKIP_PIXELS, &skip_pixels);
+    glGetIntegerv(0x88EF /* GL_PIXEL_UNPACK_BUFFER_BINDING */, &buffer);
+    auto bind_buffer = (void(APIENTRY*)(GLenum, GLuint))wglGetProcAddress("glBindBuffer");
+    if (bind_buffer) bind_buffer(0x88EC /* GL_PIXEL_UNPACK_BUFFER */, 0);
+    if (!c.tex) glGenTextures(1, &c.tex);
+    glBindTexture(GL_TEXTURE_2D, c.tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1); glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+    glPixelStorei(GL_UNPACK_SKIP_ROWS, 0); glPixelStorei(GL_UNPACK_SKIP_PIXELS, 0);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, alignment); glPixelStorei(GL_UNPACK_ROW_LENGTH, row);
+    glPixelStorei(GL_UNPACK_SKIP_ROWS, skip_rows); glPixelStorei(GL_UNPACK_SKIP_PIXELS, skip_pixels);
+    glBindTexture(GL_TEXTURE_2D, binding);
+    if (bind_buffer) bind_buffer(0x88EC, buffer);
+    c.handle = handle;
+    LOG("lobby: Steam avatar %llu image %d uploaded (%u x %u)", (unsigned long long)id, handle, w, h);
+    return c.tex;
+}
+
+void local_steam_name() {
+    if (!g.online || !g.my_team) return;
+    const char* name = mgmp::steam_persona_name(mgmp::steam_self_id());
+    if (!name[0]) return;
+    size_t n = strlen(name);
+    if (n > 31) { n = 31; while (n && (uint8_t(name[n]) & 0xC0) == 0x80) --n; }
+    memset(g.s.player_name[g.my_team - 1], 0, 32);
+    memcpy(g.s.player_name[g.my_team - 1], name, n);
+}
+
 void player_card(int t) {
     static const ImU32 kColour[2] = { IM_COL32(70, 120, 190, 255), IM_COL32(190, 70, 70, 255) };
     ImGui::BeginChild(t == 1 ? "p1" : "p2", ImVec2(0, ImGui::GetIO().DisplaySize.y * 0.20f), ImGuiChildFlags_Borders);
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImVec2 p = ImGui::GetCursorScreenPos();
     float r = 34.0f;
+    uint64_t id = g.online ? (t == g.my_team ? mgmp::steam_self_id() : g.remote_steam) : 0;
+    GLuint avatar = steam_portrait(t, id);
+    if (avatar) {
+        dl->AddImage((ImTextureID)(intptr_t)avatar, p, ImVec2(p.x + 2*r, p.y + 2*r));
+    } else {
     dl->AddCircleFilled(ImVec2(p.x + r, p.y + r), r, kColour[t - 1]);
     char initial[8] = "?";
-    const char* nm = g.s.player_name[t - 1];
+    const char* nm = g.online && t != g.my_team ? g.remote_name : g.s.player_name[t - 1];
     if (nm[0]) {   // first UTF-8 character of the name
-        int len = ((unsigned char)nm[0] < 0x80) ? 1 : ((unsigned char)nm[0] < 0xE0) ? 2 : 3;
+        int len = ((unsigned char)nm[0] < 0x80) ? 1 : ((unsigned char)nm[0] < 0xE0) ? 2 : ((unsigned char)nm[0] < 0xF0) ? 3 : 4;
         memcpy(initial, nm, len); initial[len] = 0;
     }
     ImVec2 ts = ImGui::CalcTextSize(initial);
     dl->AddText(ImVec2(p.x + r - ts.x / 2, p.y + r - ts.y / 2), IM_COL32_WHITE, initial);
+    }
     ImGui::Dummy(ImVec2(2 * r, 2 * r));
     ImGui::SameLine();
     ImGui::BeginGroup();
     ImGui::Text(g.online ? (t == g.my_team ? TR("Игрок %d (вы)", "Player %d (you)") : TR("Игрок %d (соперник)", "Player %d (opponent)")) : TR("Игрок %d", "Player %d"), t);
     ImGui::SetNextItemWidth(-1);
-    if (g.online && t != g.my_team) {
+    if (id) {
+        const char* persona = mgmp::steam_persona_name(id);
+        ImGui::TextUnformatted(persona[0] ? persona : (t == g.my_team ? g.s.player_name[t - 1] : g.remote_name));
+    } else if (g.online && t != g.my_team) {
         ImGui::BeginDisabled();
         ImGui::InputText(t == 1 ? "##n1" : "##n2", g.remote_name, sizeof g.remote_name);
         ImGui::EndDisabled();
@@ -578,6 +637,16 @@ void draw() {
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, margin), ImGuiCond_Always, ImVec2(0.5f, 0.0f));
     ImGui::Begin(TR("PvP АРЕНА", "PvP ARENA"), nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
                  ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings);
+    if (g.online) {
+        uint64_t host = g.is_host ? mgmp::steam_self_id() : g.remote_steam;
+        bool available = mgmp::steam_invite_overlay(host);
+        ImGui::BeginDisabled(!available);
+        if (ImGui::Button(TR("Пригласить", "Invite"))) mgmp::steam_invite_overlay(host, true);
+        ImGui::EndDisabled();
+        if (!available && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("%s", TR("Оверлей Steam недоступен", "Steam overlay is unavailable"));
+        ImGui::Separator();
+    }
     if (g.page) { draw_pick(g.page); ImGui::End(); return; }
     const float footer = 48.0f + ImGui::GetStyle().ItemSpacing.y * 2 + ImGui::GetStyle().WindowPadding.y + 6.0f;
     ImGui::BeginChild("body", ImVec2(0, -footer));
@@ -891,6 +960,8 @@ extern "C" void lobby_open_online(const lobby_cat* cats, int n, const lobby_sett
     g.my_team = is_host ? 1 : 2;
     g.nremote = 0;
     g.remote_name[0] = 0;
+    g.remote_steam = 0;
+    local_steam_name();
     LOG("lobby: online, this player is team %d (%s)", g.my_team, is_host ? "host" : "client");
 }
 
@@ -902,6 +973,8 @@ extern "C" void lobby_set_remote(const char* name, const lobby_cat* cats, int n)
     for (int i = 0; i < n; i++) g.remote[i].team = 3 - g.my_team;
     g.nremote = n;
 }
+
+extern "C" void lobby_set_remote_steam(unsigned long long id) { g.remote_steam = id; }
 
 extern "C" void lobby_set_settings(const lobby_settings* s) {
     char mine[32];
@@ -916,6 +989,7 @@ extern "C" void lobby_set_settings(const lobby_settings* s) {
 }
 
 extern "C" int lobby_get_local(lobby_cat* cats, char* name32, lobby_settings* s) {
+    local_steam_name();
     int t = g.my_team ? g.my_team : 1;
     int idx[LOBBY_MAX_CATS], n = team_order(t, idx);
     for (int k = 0; k < n; k++) cats[k] = g.cats[idx[k]];
