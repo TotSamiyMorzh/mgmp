@@ -23,8 +23,15 @@ Once on each computer: setup.bat
   version otherwise, and the two players would not match).
 
 Updating from 1.0.0
-- Update BOTH computers to 1.1 (network protocol 29). Mixed versions cannot connect.
-- Replace the mod files with this release; keep your local game folder.
+1. Close the game on BOTH computers.
+2. Download and unpack mewgenics_pvp_1.1.zip.
+3. Copy the contents of the NEW mewgenics_pvp folder into your OLD mod folder,
+   replacing existing files.
+4. Keep the existing game folder. If the game itself was updated, rerun
+   setup.bat and point it at the supported Steam installation (1.1.21239).
+5. Start as usual with host.bat or client.bat.
+- You do not need to move your saves.
+- BOTH players must update: protocol 29 is incompatible with v1.0.0.
 
 Host (creates the game)
 1. Steam is running.
@@ -108,8 +115,15 @@ Credits
 - После каждого обновления игры запустите setup.bat ещё раз (иначе в game  останется старая версия и у игроков не совпадут данные).
 
 Обновление с 1.0.0
-- Обновите ОБА компьютера до 1.1 (сетевой протокол 29). Разные версии несовместимы.
-- Замените файлы мода файлами релиза; локальную папку game можно оставить.
+1. Закройте игру на ОБОИХ компьютерах.
+2. Скачайте и распакуйте mewgenics_pvp_1.1.zip.
+3. Скопируйте содержимое НОВОЙ папки mewgenics_pvp в СТАРУЮ папку мода
+   с заменой существующих файлов.
+4. Существующую папку game оставьте. Если обновлялась сама игра, повторно
+   запустите setup.bat и укажите поддерживаемую установку Steam (1.1.21239).
+5. Запускайте как раньше: host.bat или client.bat.
+- Переносить сохранения не нужно.
+- ОБА игрока должны обновиться: протокол 29 несовместим с v1.0.0.
 
 Хост (кто создаёт игру)
 1. Steam запущен.

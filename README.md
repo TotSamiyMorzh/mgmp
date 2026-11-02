@@ -24,7 +24,15 @@ An unofficial two-player PvP mod for **Mewgenics 1.1.21239**, on **Windows x64**
 
 For a direct TCP connection, enter the host's IP in `client.bat`. The default port is **27600**; this requires a reachable host, a shared network or a suitable VPN.
 
-**Updating from v1.0.0:** update both players to v1.1. Network protocol **29** is incompatible with the older release. Replace the mod files; you can keep your local `game` folder. After a game update, rerun `setup.bat`; this mod is currently pinned to game version **1.1.21239**.
+### Updating from v1.0.0
+
+1. Close the game on both computers.
+2. Download and unpack `mewgenics_pvp_1.1.zip`.
+3. Copy the contents of the new `mewgenics_pvp` folder into your existing mod folder, **replacing the old files**.
+4. Keep your existing `game` folder. If the game itself was updated, rerun `setup.bat` against the supported Steam installation.
+5. Start the mod as usual with `host.bat` or `client.bat`.
+
+There is no need to move your saves. **Both players must update:** protocol **29** is incompatible with v1.0.0. The supported game version remains **1.1.21239**.
 
 ### What's new in v1.1
 
@@ -65,7 +73,15 @@ Validation: 9 automated tests pass. The facing test matched 54 paired state hash
 
 Для подключения по TCP введите IP хоста в `client.bat`. Порт по умолчанию — **27600**; нужны доступный хост, общая сеть или подходящий VPN.
 
-**Обновление с v1.0.0:** обновите обе стороны до v1.1. Протокол **29** несовместим со старой версией. Замените файлы мода; локальную папку `game` можно оставить. После обновления игры повторите `setup.bat`; мод сейчас привязан к версии **1.1.21239**.
+### Обновление с v1.0.0
+
+1. Закройте игру на обоих компьютерах.
+2. Скачайте и распакуйте `mewgenics_pvp_1.1.zip`.
+3. Скопируйте содержимое новой папки `mewgenics_pvp` в старую папку мода **с заменой файлов**.
+4. Оставьте существующую папку `game`. Если обновлялась сама игра, повторно запустите `setup.bat`, указав поддерживаемую установку Steam.
+5. Запускайте мод как раньше: `host.bat` или `client.bat`.
+
+Переносить сохранения не нужно. **Обновиться должны оба игрока:** протокол **29** несовместим с v1.0.0. Поддерживаемая версия игры — **1.1.21239**.
 
 ### Новое в v1.1
 
