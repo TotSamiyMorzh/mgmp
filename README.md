@@ -4,6 +4,17 @@ An unofficial two-player PvP mod for **Mewgenics 1.1.21239**, on **Windows x64**
 
 **[Download v1.1](https://github.com/TotSamiyMorzh/mgmp/releases/tag/v1.1)** · [Player guide / Инструкция](package/README.txt) · [Changelog](package/CHANGELOG.txt)
  · **[Community&Bug reports](https://t.me/+mPtOHrfdNFljMjVi)**
+
+## Screenshots / Скриншоты
+
+| Arena menu / Меню арены | Lobby and rules / Лобби и правила |
+| --- | --- |
+| ![Arena button in the pause menu](docs/screenshots/arena-menu.png) | ![Cat selection and arena settings](docs/screenshots/lobby-settings.png) |
+| Equipment / Экипировка | Battle / Бой |
+| ![Choosing equipment from home storage](docs/screenshots/equipment-selection.png) | ![PvP arena battle](docs/screenshots/arena-battle.png) |
+| Targeting / Выбор цели | Rematch / Реванш |
+| ![Selecting a target in the arena](docs/screenshots/arena-targeting.png) | ![Rematch and home buttons](docs/screenshots/rematch-menu.png) |
+
 ## English
 
 ### Features
