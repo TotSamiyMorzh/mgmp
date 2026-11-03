@@ -3,7 +3,7 @@
 An unofficial two-player PvP mod for **Mewgenics 1.1.21239**, on **Windows x64**. Each player selects cats from their own save and fights the other player in a configurable arena.
 
 **[Download v1.1](https://github.com/TotSamiyMorzh/mgmp/releases/tag/v1.1)** · [Player guide / Инструкция](package/README.txt) · [Changelog](package/CHANGELOG.txt)
-**[Community&Bug reports](https://t.me/+mPtOHrfdNFljMjVi)**
+ · **[Community&Bug reports](https://t.me/+mPtOHrfdNFljMjVi)**
 ## English
 
 ### Features
